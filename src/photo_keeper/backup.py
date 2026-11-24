@@ -22,7 +22,7 @@ from photo_keeper.organize import (
     local_snapshot,
     process_local,
 )
-from photo_keeper.rclone import Rclone, RemoteFile, holding_area
+from photo_keeper.rclone import Rclone, RemoteFile
 from photo_keeper.storage import _alternate, _choose_target, _digest, _existing_size, safe_path
 
 logger = logging.getLogger(__name__)
@@ -233,51 +233,17 @@ def _copy_batch(
                 logger.error("Cannot copy %s: %s", entry.path, exc)
 
 
-def _delete_source_batch(
-    client: Rclone,
-    root: Path,
-    source: str,
-    batch: tuple[tuple[RemoteFile, Path], ...],
-    result: RunResult,
-) -> None:
-    holding = holding_area(source)
-    logger.info("Holding up to %d source files at %s until verified.", len(batch), holding)
+def _delete_source_batch(client: Rclone, source: str, paths: list[Path], result: RunResult) -> bool:
+    logger.info("Deleting %d verified files from %s.", len(paths), source)
     try:
-        client.move_to_holding(source, holding, [entry.path for entry, _ in batch])
-        held = {entry.path: entry for entry in client.list_files(holding, recursive=True)}
-        confirmed: list[Path] = []
-        for original, raw in batch:
-            moved = held.get(original.path)
-            checksum = original.checksum
-            safe_path(root, raw)
-            if (
-                moved is None
-                or checksum is None
-                or moved.checksum != checksum
-                or moved.size != original.size
-                or _existing_size(raw) != original.size
-                or _digest(client, raw, checksum[0]) != checksum[1]
-            ):
-                result.failed += 1
-                logger.error(
-                    "Could not verify %s. Any moved copy stays at %s.", original.path, holding
-                )
-            else:
-                confirmed.append(original.path)
-        if confirmed:
-            client.remove_held(holding, confirmed)
-            result.source_deleted += len(confirmed)
-            logger.info("Deleted %d verified source files.", len(confirmed))
-            if len(confirmed) == len(held):
-                try:
-                    client.prune_holding(holding)
-                except KeeperError as exc:
-                    logger.warning(
-                        "Could not remove empty holding directories at %s: %s", holding, exc
-                    )
+        client.delete_files(source, paths)
     except (KeeperError, OSError) as exc:
         result.failed += 1
-        logger.error("Source cleanup failed. Check %s for held files. %s", holding, exc)
+        logger.error("Source cleanup failed for %s: %s", source, exc)
+        return False
+    result.source_deleted += len(paths)
+    logger.info("Deleted %d verified source files.", len(paths))
+    return True
 
 
 def _clean_source(
@@ -293,7 +259,7 @@ def _clean_source(
 ) -> None:
     archive = ArchiveLookup(step.destination)
     earlier = UpstreamFiles(upstream)
-    candidates = []
+    candidates: list[Path] = []
     for entry in entries:
         try:
             raw = _find_existing(client, root, step, entry, archive)
@@ -308,12 +274,16 @@ def _clean_source(
                     "Would delete source file %s after verifying its output %s", entry.path, raw
                 )
             else:
-                candidates.append((entry, raw))
+                candidates.append(entry.path)
         except (KeeperError, OSError) as exc:
             result.failed += 1
             logger.error("Cannot verify output copy for source cleanup of %s: %s", entry.path, exc)
-    for batch in batched(candidates, BATCH_SIZE):
-        _delete_source_batch(client, root, source, batch, result)
+        if len(candidates) == BATCH_SIZE:
+            if not _delete_source_batch(client, source, candidates, result):
+                return
+            candidates = []
+    if candidates:
+        _delete_source_batch(client, source, candidates, result)
 
 
 def _copy_remote(

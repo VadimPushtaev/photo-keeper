@@ -5,13 +5,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from photo_keeper import organize
+from photo_keeper import backup, organize
 from photo_keeper.backup import run_chain
 from photo_keeper.config import DeletionConfig
 from photo_keeper.errors import KeeperError
 from photo_keeper.media import MediaInfo
 from photo_keeper.organize import clean_raw, process_local
-from photo_keeper.rclone import RemoteFile, holding_area
+from photo_keeper.rclone import RemoteFile
 
 
 @pytest.fixture
@@ -183,7 +183,7 @@ def test_dry_run_only_plans_actions_whose_prerequisites_currently_exist(remote, 
     assert (preview.source_deleted, preview.raw_deleted, preview.sorted) == (0, 0, 0)
     assert all(path.exists() for path in (original, copy, pending))
     assert not (phone(monthly) / "07/month-absent.heic").exists()
-    assert not remote.downloads and not remote.holds and not remote.removed
+    assert not remote.downloads and not remote.removed
 
 
 @pytest.mark.parametrize("reason", ["same name", "same bytes", "unknown checksum", "unknown size"])
@@ -220,39 +220,27 @@ def test_raw_cleanup_requires_fresh_matching_contents(remote, monthly, side):
     assert sorted_copy.archive.exists()
 
 
-def test_cloud_cleanup_checks_verified_raw_copy_after_move(remote, monthly, monkeypatch):
+@pytest.mark.parametrize("changed", ["local", "remote"])
+def test_cloud_cleanup_checks_fresh_listing_against_output(remote, monthly, monkeypatch, changed):
     remote.add("photo.heic", b"media")
-    move = remote.move_to_holding
+    list_files = remote.list_files
+    raw = phone(monthly) / "__raw__/photo.heic"
 
-    def change_raw(source, holding, paths):
-        move(source, holding, paths)
-        (phone(monthly) / "__raw__/photo.heic").write_bytes(b"raced local edit")
+    def fresh_list(source, recursive):
+        if raw.is_file():
+            if changed == "local":
+                raw.write_bytes(b"other")
+            else:
+                remote.entries.clear()
+                remote.add("photo.heic", b"newer")
+        return list_files(source, recursive)
 
-    monkeypatch.setattr(remote, "move_to_holding", change_raw)
-    result = run_chain(remote, replace(monthly, delete=DeletionConfig(source=True, raw=True)))
-    assert result.failed == 1
-    assert result.source_deleted == result.raw_deleted == 0
-    assert remote.holds and not remote.removed
-
-
-def test_cloud_cleanup_preserves_replaced_source_bytes_in_holding(
-    remote, monthly, monkeypatch, caplog
-):
-    remote.add("photo.heic", b"media")
-    move = remote.move_to_holding
-
-    def replace_before_move(source, holding, paths):
-        remote.entries.clear()
-        remote.add("photo.heic", b"newer")
-        move(source, holding, paths)
-
-    monkeypatch.setattr(remote, "move_to_holding", replace_before_move)
-    result = run_chain(remote, replace(monthly, delete=DeletionConfig(source=True, raw=True)))
-    assert result.failed == 1
-    assert result.source_deleted == result.raw_deleted == 0
-    assert remote.holds and not remote.removed
-    assert ".photo-keeper-cleanup" in caplog.text
-    assert (phone(monthly) / "__raw__/photo.heic").read_bytes() == b"media"
+    monkeypatch.setattr(remote, "list_files", fresh_list)
+    result = run_chain(remote, replace(monthly, delete=DeletionConfig(source=True)))
+    assert result.failed == 0
+    assert result.source_deleted == 0
+    assert remote.entries and not remote.removed
+    assert raw.read_bytes() == (b"other" if changed == "local" else b"media")
 
 
 def test_cloud_cleanup_does_not_act_on_hashless_source(remote, monthly):
@@ -260,17 +248,37 @@ def test_cloud_cleanup_does_not_act_on_hashless_source(remote, monthly):
     result = run_chain(remote, replace(monthly, delete=DeletionConfig(source=True, raw=True)))
     assert result.failed == 0
     assert result.source_deleted == result.raw_deleted == 0
-    assert remote.entries and not remote.holds
+    assert remote.entries
 
 
-@pytest.mark.parametrize("failure", ["move_to_holding", "remove_held", "prune_holding"])
-def test_cloud_cleanup_error_preserves_proven_copies(remote, monthly, monkeypatch, failure):
-    remote.add("photo.heic", b"media")
-    monkeypatch.setattr(remote, failure, Mock(side_effect=KeeperError("rclone error")))
+def test_cloud_cleanup_batches_only_checksum_matches(remote, monthly, monkeypatch):
+    monkeypatch.setattr(backup, "BATCH_SIZE", 2)
+    for index in range(3):
+        remote.add(f"{index}.heic", f"media {index}".encode())
+    unverified = remote.add("unverified.heic", b"other", checksum=None)
+    delete = Mock(wraps=remote.delete_files)
+    monkeypatch.setattr(remote, "delete_files", delete)
     result = run_chain(remote, replace(monthly, delete=DeletionConfig(source=True)))
-    assert result.failed == int(failure != "prune_holding")
-    assert result.source_deleted == int(failure == "prune_holding")
+    assert result.source_deleted == 3
+    assert [call.args[1] for call in delete.call_args_list] == [
+        [Path("0.heic"), Path("1.heic")],
+        [Path("2.heic")],
+    ]
+    assert remote.entries == [unverified]
+
+
+def test_cloud_cleanup_failure_stops_further_deletes(remote, monthly, monkeypatch):
+    monkeypatch.setattr(backup, "BATCH_SIZE", 1)
+    remote.add("photo.heic", b"media")
+    remote.add("next.heic", b"other")
+    delete = Mock(side_effect=KeeperError("rclone error"))
+    monkeypatch.setattr(remote, "delete_files", delete)
+    result = run_chain(remote, replace(monthly, delete=DeletionConfig(source=True, raw=True)))
+    assert result.failed == 1
+    assert result.source_deleted == result.raw_deleted == 0
+    delete.assert_called_once_with(monthly.source, [Path("photo.heic")])
     assert (phone(monthly) / "__raw__/photo.heic").is_file()
+    assert (phone(monthly) / "__raw__/next.heic").is_file()
 
 
 def test_cleanup_uses_fresh_listing_before_removing_from_raw(remote, monthly, monkeypatch):
@@ -297,12 +305,6 @@ def test_raw_cleanup_accepts_same_size_when_checksums_prove_it_is_a_different_ob
         0,
         0,
     )
-
-
-@pytest.mark.parametrize("source", ["cloud:", "cloud:/", "cloud:.photo-keeper-cleanup/data"])
-def test_remote_holding_requires_disjoint_named_source(source):
-    with pytest.raises(KeeperError, match="outside"):
-        holding_area(source)
 
 
 def test_cleanup_rechecks_raw_even_when_the_original_copy_phase_fails(remote, monthly, monkeypatch):

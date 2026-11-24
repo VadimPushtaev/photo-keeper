@@ -220,3 +220,37 @@ def test_listing_remote_root_excludes_the_reserved_holding_area(process):
     assert [entry.path for entry in Rclone().list_files("cloud:", True)] == [
         Path("inbox/photo.heic")
     ]
+
+
+def test_delete_only_passes_literal_verified_paths_to_rclone(process):
+    Rclone().delete_files("cloud:Camera Uploads", [Path("trip/# clip.mov"), Path("photo [1].heic")])
+    process.assert_called_once_with(
+        [
+            "rclone",
+            "delete",
+            "--files-from-raw",
+            "-",
+            "--no-traverse",
+            "--no-unicode-normalization",
+            "--retries",
+            "1",
+            "--",
+            "cloud:Camera Uploads",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        input="trip/# clip.mov\nphoto [1].heic\n",
+    )
+
+
+def test_delete_with_no_files_does_not_call_rclone(process):
+    Rclone().delete_files("cloud:Camera Uploads", [])
+    process.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["cloud:", "cloud:/", "cloud:.photo-keeper-cleanup/data"])
+def test_delete_rejects_unscoped_or_recovery_folder(process, source):
+    with pytest.raises(KeeperError, match="requires a named folder"):
+        Rclone().delete_files(source, [Path("photo.heic")])
+    process.assert_not_called()

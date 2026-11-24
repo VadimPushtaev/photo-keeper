@@ -90,6 +90,9 @@ def test_chain_sort_and_cleanup_with_a_real_local_rclone_remote(tmp_path, capfd)
     os.utime(remote_video, (timestamp, timestamp))
     outside_source = remote / "leave-alone.mov"
     outside_source.write_bytes(b"outside the scoped source")
+    recovery = remote / ".photo-keeper-cleanup/previous-run/keep.mov"
+    recovery.parent.mkdir(parents=True)
+    recovery.write_bytes(b"older recovery copy")
     archive = tmp_path / "archive"
     archive.mkdir()
     (tmp_path / "rclone.conf").write_text(f"[fixture]\ntype = alias\nremote = {remote}\n")
@@ -116,7 +119,8 @@ def test_chain_sort_and_cleanup_with_a_real_local_rclone_remote(tmp_path, capfd)
     assert not remote_video.exists()
     assert not (archive / "2025/phone/__raw__/trip/# clip.mov").exists()
     assert outside_source.read_bytes() == b"outside the scoped source"
-    assert not list((remote / ".photo-keeper-cleanup").iterdir())
+    assert list(recovery.parent.parent.iterdir()) == [recovery.parent]
+    assert recovery.read_bytes() == b"older recovery copy"
     assert main(args) == 0
     assert "source_deleted=0, raw_deleted=0" in capfd.readouterr().out
     assert result.is_file()

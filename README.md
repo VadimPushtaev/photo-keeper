@@ -92,12 +92,11 @@ and outputs that would turn an earlier source into a later destination.
 Cleanup refreshes earlier file listings before deleting and retains files when upstream
 presence is uncertain. Dry runs preview cleanup only when the verified output already exists.
 
-Remote cleanup requires a named folder and permission to move and delete files.
-It moves eligible files to `.photo-keeper-cleanup/<id>` on the same remote, then compares
-their checksums with the local outputs before deleting them from the holding folder. If
-the operation is interrupted or verification fails, any remaining held files stay recoverable
-at the remote path printed in the log. Runs starting at the remote root skip this holding
-area. Remote files without a comparable checksum are retained.
+Remote cleanup requires a named folder and permission to delete files. It checks a fresh
+listing against the local output by size and checksum, then deletes the verified paths
+directly from the source. This assumes files stay unchanged at those paths during cleanup.
+Files without a comparable checksum are retained. Existing recovery files from older
+versions in `.photo-keeper-cleanup/` remain outside normal chain processing.
 
 ## Run
 
