@@ -1,0 +1,6 @@
+# Copy to config.toml and add a table for each chain.
+# Only chain names and enabled flags are supported in the scaffold.
+# Execution and media operations will be implemented separately.
+[[chains]]
+name = "example"
+enabled = false

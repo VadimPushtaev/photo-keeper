@@ -1,0 +1,20 @@
+# Python and development tools
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local configuration, credentials, and runtime data
+.env
+.env.*
+!.env.example
+/config.toml
+/data/
+/logs/
+*.log
