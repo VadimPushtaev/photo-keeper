@@ -27,7 +27,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser("check-config", help="Validate the chain configuration")
     commands.add_parser("list-chains", help="List configured chains and their enabled status")
     commands.add_parser("login", help="Open interactive rclone remote setup")
-    run = commands.add_parser("run", help="Copy a chain once and exit")
+    run = commands.add_parser("run", help="Run the configured chain steps once and exit")
     run.add_argument("chain", help="Name of the configured chain")
     run.add_argument(
         "--dry-run", action="store_true", help="Inspect destinations without writing files"
@@ -79,6 +79,10 @@ def execute(args: argparse.Namespace) -> int:
     print(
         f"{'Dry run' if args.dry_run else 'Run'} {chain.name}: "
         f"copied={result.copied}, unchanged={result.unchanged}, planned={result.planned}, "
+        f"sorted={result.sorted}, sort_planned={result.sort_planned}, "
+        f"source_deleted={result.source_deleted}, raw_deleted={result.raw_deleted}, "
+        f"source_delete_planned={result.source_delete_planned}, "
+        f"raw_delete_planned={result.raw_delete_planned}, "
         f"failed={result.failed}."
     )
     return 1 if result.failed else 0

@@ -1,10 +1,8 @@
 """Sort verified rclone downloads into the local archive."""
 
 import fcntl
-import hashlib
 import logging
 import os
-import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -15,9 +13,10 @@ from pathlib import Path
 
 from photo_keeper.config import ChainConfig
 from photo_keeper.errors import KeeperError
-from photo_keeper.hashing import hash_file as dropbox_hash
 from photo_keeper.media import capture_year
-from photo_keeper.rclone import Rclone, RemoteFile
+from photo_keeper.organize import clean_raw, sort_raw
+from photo_keeper.rclone import Rclone, RemoteFile, holding_area
+from photo_keeper.storage import _alternate, _choose_target, _digest, _existing_size, safe_path
 
 logger = logging.getLogger(__name__)
 BATCH_SIZE = 16
@@ -29,6 +28,12 @@ class RunResult:
     unchanged: int = 0
     planned: int = 0
     failed: int = 0
+    sorted: int = 0
+    sort_planned: int = 0
+    source_deleted: int = 0
+    raw_deleted: int = 0
+    source_delete_planned: int = 0
+    raw_delete_planned: int = 0
 
 
 def _format_size(size: int) -> str:
@@ -57,73 +62,6 @@ def destination_lock(root: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
-
-
-def safe_path(root: Path, path: Path) -> None:
-    """Refuse symlinks below the configured root, including broken symlinks."""
-    try:
-        relative = path.relative_to(root)
-    except ValueError as exc:
-        raise KeeperError("Destination path escapes the configured root.") from exc
-    current = root
-    for part in relative.parts:
-        if part in {".", ".."}:
-            raise KeeperError("Destination path escapes the configured root.")
-        current /= part
-        if current.is_symlink():
-            raise KeeperError(f"Refusing destination symlink: {current}")
-
-
-def _digest(client: Rclone, path: Path, kind: str) -> str:
-    if kind == "dropbox":
-        return dropbox_hash(path)
-    if kind == "quickxor":
-        return client.quickxor(path)
-    with path.open("rb") as file:
-        return hashlib.file_digest(file, kind).hexdigest()
-
-
-def _existing_size(path: Path) -> int | None:
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        raise KeeperError(f"Destination is not a regular file: {path}")
-    return info.st_size
-
-
-def _alternate(target: Path, digest: str) -> Path:
-    name = f"{target.stem}--{digest}{target.suffix}"
-    if len(name.encode()) > 255:
-        # Preserve a normal extension and distinguish long names sharing a prefix.
-        suffix = target.suffix.encode()[:32].decode(errors="ignore")
-        name_hash = hashlib.sha256(target.name.encode()).hexdigest()[:12]
-        ending = f"--{name_hash}--{digest}{suffix}"
-        stem = target.stem.encode()[: 255 - len(ending.encode())].decode(errors="ignore")
-        name = stem + ending
-    return target.with_name(name)
-
-
-def _choose_target(
-    client: Rclone, root: Path, target: Path, size: int, checksum: tuple[str, str]
-) -> tuple[Path, bool]:
-    kind, digest = checksum
-    alternate = _alternate(target, digest)
-    safe_path(root, target)
-    original_size = _existing_size(target)
-    if original_size == size and _digest(client, target, kind) == digest:
-        return target, True
-    # Check the alternate too, since the original could have been moved out of the archive.
-    safe_path(root, alternate)
-    alternate_size = _existing_size(alternate)
-    if alternate_size == size and _digest(client, alternate, kind) == digest:
-        return alternate, True
-    if original_size is None:
-        return target, False
-    if alternate_size is not None:
-        raise KeeperError(f"Conflicting content already exists at {alternate}")
-    return alternate, False
 
 
 def _year(entry: RemoteFile, date_source: str, path: Path) -> int:
@@ -291,6 +229,84 @@ def _copy_batch(
                 logger.error("Cannot copy %s: %s", entry.path, exc)
 
 
+def _delete_source_batch(
+    client: Rclone,
+    root: Path,
+    source: str,
+    batch: tuple[tuple[RemoteFile, Path], ...],
+    result: RunResult,
+) -> None:
+    holding = holding_area(source)
+    logger.info("Holding up to %d source files at %s until verified.", len(batch), holding)
+    try:
+        client.move_to_holding(source, holding, [entry.path for entry, _ in batch])
+        held = {entry.path: entry for entry in client.list_files(holding, recursive=True)}
+        confirmed: list[Path] = []
+        for original, raw in batch:
+            moved = held.get(original.path)
+            checksum = original.checksum
+            safe_path(root, raw)
+            if (
+                moved is None
+                or checksum is None
+                or moved.checksum != checksum
+                or moved.size != original.size
+                or _existing_size(raw) != original.size
+                or _digest(client, raw, checksum[0]) != checksum[1]
+            ):
+                result.failed += 1
+                logger.error(
+                    "Could not verify %s. Any moved copy stays at %s.", original.path, holding
+                )
+            else:
+                confirmed.append(original.path)
+        if confirmed:
+            client.remove_held(holding, confirmed)
+            result.source_deleted += len(confirmed)
+            logger.info("Deleted %d verified source files.", len(confirmed))
+            if len(confirmed) == len(held):
+                try:
+                    client.prune_holding(holding)
+                except KeeperError as exc:
+                    logger.warning(
+                        "Could not remove empty holding directories at %s: %s", holding, exc
+                    )
+    except (KeeperError, OSError) as exc:
+        result.failed += 1
+        logger.error("Source cleanup failed. Check %s for held files. %s", holding, exc)
+
+
+def _clean_source(
+    client: Rclone,
+    root: Path,
+    chain: ChainConfig,
+    source: str,
+    upstream: list[RemoteFile],
+    result: RunResult,
+    *,
+    dry_run: bool,
+) -> None:
+    archive = ArchiveLookup(root)
+    candidates = []
+    for entry in upstream:
+        try:
+            raw = _find_existing(client, root, chain, entry, archive)
+            if raw is None:
+                continue
+            if dry_run:
+                result.source_delete_planned += 1
+                logger.info(
+                    "Would delete source file %s after verifying raw copy %s", entry.path, raw
+                )
+            else:
+                candidates.append((entry, raw))
+        except (KeeperError, OSError) as exc:
+            result.failed += 1
+            logger.error("Cannot verify raw copy for source cleanup of %s: %s", entry.path, exc)
+    for batch in batched(candidates, BATCH_SIZE):
+        _delete_source_batch(client, root, source, batch, result)
+
+
 def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> RunResult:
     if not chain.enabled:
         raise KeeperError(f"Chain {chain.name!r} is disabled.")
@@ -304,7 +320,8 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
     with nullcontext() if dry_run else destination_lock(root):
         archive = ArchiveLookup(root)
         pending = []
-        for entry in client.list_files(chain.source, chain.recursive):
+        upstream = client.list_files(chain.source, chain.recursive)
+        for entry in upstream:
             try:
                 existing = _find_existing(client, root, chain, entry, archive)
                 if existing is not None:
@@ -337,4 +354,34 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
         for number, batch in enumerate(batched(pending, BATCH_SIZE), start=1):
             _log_batch(batch, number, batch_count)
             _copy_batch(client, root, chain, chain.source, batch, result)
+
+        if chain.sort_by_month:
+            logger.info("Checking raw files for month sorting.")
+            sorted_files = sort_raw(
+                client,
+                root,
+                chain,
+                ArchiveLookup(root).years,
+                dry_run=dry_run,
+            )
+            result.sorted = sorted_files.sorted
+            result.sort_planned = sorted_files.planned
+            result.failed += sorted_files.failed
+
+        before_source_cleanup = result.failed
+        if chain.delete.source:
+            if not dry_run:
+                upstream = client.list_files(chain.source, chain.recursive)
+            _clean_source(client, root, chain, chain.source, upstream, result, dry_run=dry_run)
+        if chain.sort_by_month and chain.delete.raw and before_source_cleanup == result.failed:
+            if not dry_run:
+                upstream = client.list_files(chain.source, chain.recursive)
+            result.raw_deleted, result.raw_delete_planned, failures = clean_raw(
+                client,
+                root,
+                sorted_files.copies,
+                upstream,
+                dry_run=dry_run,
+            )
+            result.failed += failures
     return result

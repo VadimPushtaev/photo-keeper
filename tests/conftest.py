@@ -22,6 +22,8 @@ class FakeRclone:
         self.downloads = []
         self.batches = []
         self.list_calls = []
+        self.holds = {}
+        self.removed = []
 
     def add(self, path="photo.jpg", data=b"photo contents", **overrides):
         path = Path(path)
@@ -37,7 +39,19 @@ class FakeRclone:
 
     def list_files(self, source, recursive):
         self.list_calls.append((source, recursive))
-        return self.entries
+        return list(self.holds.get(source, self.entries))
+
+    def move_to_holding(self, source, holding, paths):
+        self.holds[holding] = [entry for entry in self.entries if entry.path in paths]
+        self.entries = [entry for entry in self.entries if entry.path not in paths]
+
+    def remove_held(self, holding, paths):
+        self.removed.extend(paths)
+        self.holds[holding] = [entry for entry in self.holds[holding] if entry.path not in paths]
+
+    def prune_holding(self, holding):
+        assert not self.holds[holding]
+        del self.holds[holding]
 
     def download_batch(self, source, entries, target):
         self.batches.append(tuple(entry.path for entry in entries))

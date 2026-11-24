@@ -3,6 +3,7 @@
 import json
 import re
 import subprocess
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,6 +12,18 @@ from pathlib import Path
 from photo_keeper.errors import KeeperError
 
 _HASH_LENGTHS = {"sha256": 64, "dropbox": 64, "sha1": 40, "md5": 32, "quickxor": 40}
+HOLD_FOLDER = ".photo-keeper-cleanup"
+
+
+def _manifest(paths: Sequence[Path]) -> str:
+    return "".join(f"{path.as_posix()}\n" for path in paths)
+
+
+def holding_area(source: str) -> str:
+    remote, _, folder = source.partition(":")
+    if not folder.strip("/") or folder.strip("/").split("/")[0].casefold() == HOLD_FOLDER:
+        raise KeeperError("Source cleanup requires a named folder outside the holding area.")
+    return f"{remote}:{HOLD_FOLDER}/{uuid.uuid4().hex}"
 
 
 @dataclass(frozen=True)
@@ -101,10 +114,11 @@ class Rclone:
                     f"rclone listed multiple files at {entry.path}. Resolve the duplicate."
                 )
             seen.add(entry.path)
+        if source.partition(":")[2] in {"", "/"}:
+            files = [entry for entry in files if entry.path.parts[0].casefold() != HOLD_FOLDER]
         return files
 
     def download_batch(self, source: str, entries: Sequence[RemoteFile], target: Path) -> None:
-        manifest = "".join(f"{entry.path.as_posix()}\n" for entry in entries)
         self._run(
             "copy",
             "--files-from-raw",
@@ -122,8 +136,38 @@ class Rclone:
             source,
             str(target),
             inherit_output=True,
-            input_text=manifest,
+            input_text=_manifest([entry.path for entry in entries]),
         )
+
+    def move_to_holding(self, source: str, holding: str, paths: Sequence[Path]) -> None:
+        self._run(
+            "move",
+            "--files-from-raw",
+            "-",
+            "--no-traverse",
+            "--retries",
+            "1",
+            "--",
+            source,
+            holding,
+            input_text=_manifest(paths),
+        )
+
+    def remove_held(self, holding: str, paths: Sequence[Path]) -> None:
+        self._run(
+            "delete",
+            "--files-from-raw",
+            "-",
+            "--no-traverse",
+            "--retries",
+            "1",
+            "--",
+            holding,
+            input_text=_manifest(paths),
+        )
+
+    def prune_holding(self, holding: str) -> None:
+        self._run("rmdirs", "--", holding)
 
     def quickxor(self, path: Path) -> str:
         output = self._run("hashsum", "quickxor", "--", str(path))

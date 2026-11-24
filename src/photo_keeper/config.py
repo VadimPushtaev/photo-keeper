@@ -5,9 +5,18 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from photo_keeper.rclone import HOLD_FOLDER
+
 
 class ConfigError(ValueError):
     """The configuration could not be read or contains invalid values."""
+
+
+@dataclass(frozen=True)
+class DeletionConfig:
+    source: bool = False
+    raw: bool = False
+    archive: bool = False
 
 
 @dataclass(frozen=True)
@@ -19,6 +28,8 @@ class ChainConfig:
     subdirectory: str = "__raw__"
     recursive: bool = True
     date_source: str = "capture"
+    sort_by_month: bool = False
+    delete: DeletionConfig = DeletionConfig()
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,17 @@ def _relative_path(value: object, label: str) -> str:
     ):
         raise ConfigError(f"{label} must be a relative path without empty, '.' or '..' components.")
     return value
+
+
+def _deletion_settings(value: object, label: str) -> DeletionConfig:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{label} delete must be a table.")
+    for step, enabled in value.items():
+        if step not in {"source", "raw", "archive"} or not isinstance(enabled, bool):
+            raise ConfigError(
+                f"{label} delete.{step} must be a boolean for source, raw, or archive."
+            )
+    return DeletionConfig(**value)
 
 
 def load_config(path: Path) -> AppConfig:
@@ -91,6 +113,8 @@ def load_config(path: Path) -> AppConfig:
             "subdirectory",
             "recursive",
             "date_source",
+            "sort_by_month",
+            "delete",
         }:
             raise ConfigError(f"{label} has unknown keys: {', '.join(sorted(unknown))}")
 
@@ -110,6 +134,8 @@ def load_config(path: Path) -> AppConfig:
                 raise ConfigError(f"{label} source must be a named rclone remote (remote:path).")
             if folder not in ("", "/"):
                 _relative_path(folder.removeprefix("/"), f"{label} source")
+            if folder.strip("/").split("/")[0].casefold() == HOLD_FOLDER:
+                raise ConfigError(f"{label} source is inside the reserved cleanup holding area.")
 
         destination = raw_chain.get("destination")
         if destination is not None:
@@ -126,6 +152,16 @@ def load_config(path: Path) -> AppConfig:
         date_source = raw_chain.get("date_source", "capture")
         if date_source not in ("capture", "modified"):
             raise ConfigError(f"{label} date_source must be 'capture' or 'modified'.")
+        sort_by_month = raw_chain.get("sort_by_month", False)
+        if not isinstance(sort_by_month, bool):
+            raise ConfigError(f"{label} sort_by_month must be a boolean.")
+        if sort_by_month and PurePosixPath(subdirectory).name != "__raw__":
+            raise ConfigError(f"{label} month sorting requires subdirectory to end in '__raw__'.")
+        deletion = _deletion_settings(raw_chain.get("delete", {}), label)
+        if deletion.source and source is not None and not source.partition(":")[2].strip("/"):
+            raise ConfigError(
+                f"{label} source cleanup requires a named folder, not the remote root."
+            )
 
         chains.append(
             ChainConfig(
@@ -136,6 +172,8 @@ def load_config(path: Path) -> AppConfig:
                 subdirectory=subdirectory,
                 recursive=recursive,
                 date_source=date_source,
+                sort_by_month=sort_by_month,
+                delete=deletion,
             )
         )
         names.add(name)

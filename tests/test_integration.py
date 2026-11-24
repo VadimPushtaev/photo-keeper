@@ -73,3 +73,42 @@ def test_real_local_rclone_remote_and_capture_year(tmp_path, capfd, caplog):
     assert (archive / "2025/Камера/__raw__/# note [file].txt").read_bytes() == b"sidecar"
     assert main(args) == 0, caplog.text
     assert "unchanged=2" in capfd.readouterr().out
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="Requires rclone")
+def test_chain_sort_and_cleanup_with_a_real_local_rclone_remote(tmp_path, capfd):
+    remote = tmp_path / "remote"
+    nested = remote / "Camera Uploads" / "trip"
+    nested.mkdir(parents=True)
+    remote_video = nested / "# clip.mov"
+    remote_video.write_bytes(b"original video fixture")
+    timestamp = 1752170400  # July 2025.
+    os.utime(remote_video, (timestamp, timestamp))
+    outside_source = remote / "leave-alone.mov"
+    outside_source.write_bytes(b"outside the scoped source")
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (tmp_path / "rclone.conf").write_text(f"[fixture]\ntype = alias\nremote = {remote}\n")
+    config = tmp_path / "chain.toml"
+    config.write_text(
+        '[rclone]\nconfig_file = "rclone.conf"\n'
+        '[[chains]]\nname = "camera"\nenabled = true\nsource = "fixture:Camera Uploads"\n'
+        f'destination = {json.dumps(str(archive))}\nsubdirectory = "phone/__raw__"\n'
+        'date_source = "modified"\nsort_by_month = true\n'
+        "[chains.delete]\nsource = true\nraw = true\narchive = true\n",
+    )
+    args = ["--config", str(config), "run", "camera"]
+    assert main([*args, "--dry-run"]) == 0
+    assert remote_video.exists()
+    assert not list(archive.iterdir())
+    assert main(args) == 0
+    assert "source_deleted=1, raw_deleted=1" in capfd.readouterr().out
+    result = archive / "2025/phone/07/video/trip/# clip.mov"
+    assert result.read_bytes() == b"original video fixture"
+    assert not remote_video.exists()
+    assert not (archive / "2025/phone/__raw__/trip/# clip.mov").exists()
+    assert outside_source.read_bytes() == b"outside the scoped source"
+    assert not list((remote / ".photo-keeper-cleanup").iterdir())
+    assert main(args) == 0
+    assert "source_deleted=0, raw_deleted=0" in capfd.readouterr().out
+    assert result.is_file()

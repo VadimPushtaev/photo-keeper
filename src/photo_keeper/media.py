@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -10,10 +11,23 @@ from photo_keeper.errors import KeeperError
 _CAPTURE_TAGS = ("DateTimeOriginal", "CreationDate", "MediaCreateDate", "CreateDate")
 
 
-def capture_year(path: Path) -> int | None:
+@dataclass(frozen=True)
+class MediaInfo:
+    capture_date: date | None
+    has_camera: bool
+
+
+def read_media_info(path: Path) -> MediaInfo:
     try:
         result = subprocess.run(
-            ["exiftool", "-j", *("-" + tag for tag in _CAPTURE_TAGS), str(path)],
+            [
+                "exiftool",
+                "-j",
+                *("-" + tag for tag in _CAPTURE_TAGS),
+                "-EXIF:Make",
+                "-EXIF:Model",
+                str(path),
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -36,11 +50,17 @@ def capture_year(path: Path) -> int | None:
     except ValueError as exc:
         raise KeeperError(f"ExifTool could not inspect {path.name}.") from exc
 
+    has_camera = any(str(tags.get(key) or "").strip() for key in ("Make", "Model"))
     for tag in _CAPTURE_TAGS:
         value = tags.get(tag)
         if isinstance(value, str):
             try:
-                return date.fromisoformat(value[:10].replace(":", "-")).year
+                return MediaInfo(date.fromisoformat(value[:10].replace(":", "-")), has_camera)
             except ValueError:
                 continue
-    return None
+    return MediaInfo(None, has_camera)
+
+
+def capture_year(path: Path) -> int | None:
+    captured = read_media_info(path).capture_date
+    return captured.year if captured is not None else None

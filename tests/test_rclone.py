@@ -209,3 +209,14 @@ def test_quickxor_never_accepts_missing_or_invalid_results(process, tmp_path, ou
     process.return_value.stdout = output
     with pytest.raises(KeeperError, match="invalid QuickXor"):
         Rclone().quickxor(tmp_path / "file")
+
+
+def test_listing_remote_root_excludes_the_reserved_holding_area(process):
+    mock_listing(
+        process,
+        file_entry(Path="inbox/photo.heic"),
+        file_entry(Path=".photo-keeper-cleanup/hold/photo.heic"),
+    )
+    assert [entry.path for entry in Rclone().list_files("cloud:", True)] == [
+        Path("inbox/photo.heic")
+    ]

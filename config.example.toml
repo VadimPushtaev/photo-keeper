@@ -9,3 +9,9 @@ destination = "/absolute/path/to/photos"
 subdirectory = "phone/__raw__"
 recursive = true
 date_source = "capture"
+sort_by_month = true
+
+[chains.delete]
+source = false
+raw = false
+archive = false

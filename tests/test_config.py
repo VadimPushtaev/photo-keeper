@@ -175,3 +175,34 @@ def test_old_dropbox_settings_have_migration_message(tmp_path: Path) -> None:
     path.write_text("[dropbox]\n")
     with pytest.raises(ConfigError, match=r"Replace \[dropbox\]"):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    "source,settings,match",
+    [
+        ("cloud:folder", 'sort_by_month = "yes"', "sort_by_month must be a boolean"),
+        ("cloud:folder", 'sort_by_month = true\nsubdirectory = "other"', "ends? in|to end in"),
+        ("cloud:folder", "delete = true", "delete must be a table"),
+        ("cloud:folder", 'delete = {source = "true"}', "delete.source"),
+        ("cloud:folder", "delete = {wrong = true}", "delete.wrong"),
+        ("cloud:", "delete = {source = true}", "requires a named folder"),
+        ("cloud:/.photo-keeper-cleanup/abc", "", "reserved cleanup holding area"),
+    ],
+)
+def test_month_and_cleanup_settings_validation(tmp_path, source, settings, match):
+    config = tmp_path / "config.toml"
+    config.write_text(f'[[chains]]\nname = "phone"\nsource = "{source}"\n{settings}')
+    with pytest.raises(ConfigError, match=match):
+        load_config(config)
+
+
+def test_each_step_needs_explicit_deletion_permission(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[[chains]]\nname = "phone"\nsource = "cloud:folder"\nsort_by_month = true\n'
+        "[chains.delete]\nraw = true\narchive = true\n"
+    )
+    (chain,) = load_config(config).chains
+    assert chain.sort_by_month
+    assert not chain.delete.source
+    assert chain.delete.raw and chain.delete.archive
