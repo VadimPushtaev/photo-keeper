@@ -70,6 +70,10 @@ exact year is determined after download. Planning reads the filenames in each re
 archive folder once and hashes only potential matches.
 
 Rclone downloads pending files in batches of up to 16, with four transfers in parallel.
+The log shows the batch number, total size, and largest listed file. Rclone reports bytes
+transferred, transfer rate, and estimated time remaining every five seconds during a download.
+Dry runs and copy logs also show individual file sizes.
+
 Each batch downloads into a temporary directory on the destination drive. Photo Keeper
 checks the expected size and supported remote checksum before publishing each copy. Backends
 without a supported checksum may need to download the file again on subsequent runs so its

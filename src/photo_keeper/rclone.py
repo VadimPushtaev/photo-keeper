@@ -60,7 +60,7 @@ class Rclone:
         self.config_file = config_file
 
     def _run(
-        self, *arguments: str, interactive: bool = False, input_text: str | None = None
+        self, *arguments: str, inherit_output: bool = False, input_text: str | None = None
     ) -> str:
         command = ["rclone"]
         if self.config_file is not None:
@@ -70,7 +70,7 @@ class Rclone:
                 [*command, *arguments],
                 check=True,
                 text=True,
-                capture_output=not interactive,
+                capture_output=not inherit_output,
                 input=input_text,
             )
         except FileNotFoundError as exc:
@@ -82,7 +82,7 @@ class Rclone:
         return result.stdout or ""
 
     def configure(self) -> None:
-        self._run("config", interactive=True)
+        self._run("config", inherit_output=True)
 
     def list_files(self, source: str, recursive: bool) -> list[RemoteFile]:
         flags = ("--recursive",) if recursive else ()
@@ -113,9 +113,15 @@ class Rclone:
             "--no-unicode-normalization",
             "--transfers",
             "4",
+            "--stats",
+            "5s",
+            "--stats-one-line",
+            "--stats-log-level",
+            "NOTICE",
             "--",
             source,
             str(target),
+            inherit_output=True,
             input_text=manifest,
         )
 

@@ -21,7 +21,7 @@ def png_chunk(kind: bytes, data: bytes) -> bytes:
     not shutil.which("rclone") or not shutil.which("exiftool"),
     reason="Requires rclone and ExifTool",
 )
-def test_real_local_rclone_remote_and_capture_year(tmp_path, capsys, caplog):
+def test_real_local_rclone_remote_and_capture_year(tmp_path, capfd, caplog):
     inbox = tmp_path / "Camera Uploads"
     nested = inbox / "Поездка"
     nested.mkdir(parents=True)
@@ -59,13 +59,17 @@ def test_real_local_rclone_remote_and_capture_year(tmp_path, capsys, caplog):
     )
     args = ["--config", str(conf), "run", "camera"]
     assert main([*args, "--dry-run"]) == 0, caplog.text
-    assert "planned=2" in capsys.readouterr().out
+    preview = capfd.readouterr()
+    assert "planned=2" in preview.out
+    assert "ETA" not in preview.err
     assert not list(archive.iterdir())
     assert main(args) == 0, caplog.text
-    assert "copied=2" in capsys.readouterr().out
+    copied = capfd.readouterr()
+    assert "copied=2" in copied.out
+    assert "100%" in copied.err and "ETA" in copied.err
     local_photo = archive / "2021/Камера/__raw__/Поездка/Снимок.png"
     assert local_photo.read_bytes() == remote_photo.read_bytes()
     assert local_photo.stat().st_mtime == timestamp
     assert (archive / "2025/Камера/__raw__/# note [file].txt").read_bytes() == b"sidecar"
     assert main(args) == 0, caplog.text
-    assert "unchanged=2" in capsys.readouterr().out
+    assert "unchanged=2" in capfd.readouterr().out

@@ -354,3 +354,27 @@ def test_interrupt_keeps_published_batches(remote, chain, monkeypatch):
     assert target_path(chain, name="first.jpg").is_file()
     assert not target_path(chain, name="second.jpg").exists()
     assert_no_staging(chain)
+
+
+def test_batch_logs_largest_file_and_actual_sizes(remote, chain, monkeypatch, caplog):
+    monkeypatch.setattr(backup, "BATCH_SIZE", 2)
+    remote.add("photo.jpg", b"x" * 1024)
+    remote.add("large-video.mov", b"x" * (3 * 1024 * 1024))
+    remote.add("unknown-video.mov", b"x" * 2048, size=-1)
+    with caplog.at_level("INFO"):
+        assert run_chain(remote, chain).copied == 3
+    assert "Downloading batch 1/2 (2 files, 3.0 MiB)" in caplog.text
+    assert "Largest listed file is large-video.mov (3.0 MiB)" in caplog.text
+    assert "Downloading batch 2/2 (1 file, size unknown)" in caplog.text
+    assert "Copied photo.jpg (1.0 KiB)" in caplog.text
+    assert "Copied unknown-video.mov (2.0 KiB)" in caplog.text
+
+
+def test_preview_shows_reported_file_sizes_without_downloading(remote, chain, caplog):
+    remote.add("large-video.mov", size=2 * 1024**3)
+    remote.add("unknown.mov", size=-1)
+    with caplog.at_level("INFO"):
+        assert run_chain(remote, chain, dry_run=True).planned == 2
+    assert "Would download large-video.mov (2.0 GiB)" in caplog.text
+    assert "Would download unknown.mov (unknown size)" in caplog.text
+    assert remote.downloads == []

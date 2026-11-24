@@ -31,6 +31,19 @@ class RunResult:
     failed: int = 0
 
 
+def _format_size(size: int) -> str:
+    if size < 0:
+        return "unknown size"
+    if size < 1024:
+        return f"{size} B"
+    scaled = size / 1024
+    for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
+        if scaled < 1024:
+            return f"{scaled:.1f} {unit}"
+        scaled /= 1024
+    return f"{scaled:.1f} EiB"
+
+
 @contextmanager
 def destination_lock(root: Path) -> Iterator[None]:
     """Use a persistent lock inode, released by the OS even if a process crashes."""
@@ -187,7 +200,7 @@ def _find_existing(
 
 def _publish_file(
     client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, staged: Path
-) -> tuple[Path, bool]:
+) -> tuple[Path, bool, int]:
     size = _existing_size(staged)
     if size is None:
         raise KeeperError("rclone did not download the listed file.")
@@ -213,7 +226,29 @@ def _publish_file(
         with staged.open("rb") as file:
             os.fsync(file.fileno())
         os.link(staged, target)  # Fails if the target appeared concurrently.
-    return target, unchanged
+    return target, unchanged, size
+
+
+def _log_batch(entries: tuple[RemoteFile, ...], number: int, count: int) -> None:
+    known = [entry for entry in entries if entry.size >= 0]
+    file_count = f"{len(entries)} {'file' if len(entries) == 1 else 'files'}"
+    if not known:
+        logger.info("Downloading batch %d/%d (%s, size unknown).", number, count, file_count)
+        return
+    total = _format_size(sum(entry.size for entry in known))
+    unknown = len(entries) - len(known)
+    if unknown:
+        total += f" listed, {unknown} with unknown size"
+    largest = max(known, key=lambda entry: entry.size)
+    logger.info(
+        "Downloading batch %d/%d (%s, %s). Largest listed file is %s (%s).",
+        number,
+        count,
+        file_count,
+        total,
+        largest.path,
+        _format_size(largest.size),
+    )
 
 
 def _copy_batch(
@@ -224,7 +259,6 @@ def _copy_batch(
     entries: tuple[RemoteFile, ...],
     result: RunResult,
 ) -> None:
-    logger.info("Downloading batch of %d files.", len(entries))
     with tempfile.TemporaryDirectory(prefix=".photo-keeper-", dir=root) as folder:
         staging = Path(folder)
         batch_failed = False
@@ -234,6 +268,7 @@ def _copy_batch(
             batch_failed = True
             logger.warning("rclone batch reported an error: %s", exc)
 
+        logger.info("Verifying and filing the downloaded batch.")
         for entry in entries:
             try:
                 # A failed transfer can leave a staged file behind. Match the listed
@@ -244,13 +279,13 @@ def _copy_batch(
                     )
                 staged = staging / entry.path
                 safe_path(staging, staged)
-                target, unchanged = _publish_file(client, root, chain, entry, staged)
+                target, unchanged, size = _publish_file(client, root, chain, entry, staged)
                 if unchanged:
                     result.unchanged += 1
-                    logger.info("Already verified: %s", target)
+                    logger.info("Already verified: %s (%s)", target, _format_size(size))
                 else:
                     result.copied += 1
-                    logger.info("Copied %s to %s", entry.path, target)
+                    logger.info("Copied %s (%s) to %s", entry.path, _format_size(size), target)
             except (KeeperError, OSError) as exc:
                 result.failed += 1
                 logger.error("Cannot copy %s: %s", entry.path, exc)
@@ -274,14 +309,23 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
                 existing = _find_existing(client, root, chain, entry, archive)
                 if existing is not None:
                     result.unchanged += 1
-                    logger.info("Already verified: %s", existing)
+                    logger.info("Already verified: %s (%s)", existing, _format_size(entry.size))
                 elif dry_run:
                     if chain.date_source == "modified":
                         year = _year(entry, chain.date_source, root)
                         target = _target(root, chain, entry, year)
-                        logger.info("Would check and copy %s into %s", entry.path, target.parent)
+                        logger.info(
+                            "Would check and copy %s (%s) into %s",
+                            entry.path,
+                            _format_size(entry.size),
+                            target.parent,
+                        )
                     else:
-                        logger.info("Would download %s to check its capture year.", entry.path)
+                        logger.info(
+                            "Would download %s (%s) to check its capture year.",
+                            entry.path,
+                            _format_size(entry.size),
+                        )
                     result.planned += 1
                 else:
                     pending.append(entry)
@@ -289,6 +333,8 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
                 result.failed += 1
                 logger.error("Cannot copy %s: %s", entry.path, exc)
 
-        for batch in batched(pending, BATCH_SIZE):
+        batch_count = (len(pending) + BATCH_SIZE - 1) // BATCH_SIZE
+        for number, batch in enumerate(batched(pending, BATCH_SIZE), start=1):
+            _log_batch(batch, number, batch_count)
             _copy_batch(client, root, chain, chain.source, batch, result)
     return result
