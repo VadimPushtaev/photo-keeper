@@ -8,7 +8,7 @@ from photo_keeper.config import ConfigError, load_config
 def test_load_multiple_chains(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[[chains]]\nname = "first"\nenabled = true\nsource = "/Camera Uploads"\n'
+        '[[chains]]\nname = "first"\nenabled = true\nsource = "dropbox:Camera Uploads"\n'
         'destination = "/photos"\n[[chains]]\nname = "second"\n',
         encoding="utf-8",
     )
@@ -69,11 +69,11 @@ def test_invalid_encoding(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("field", "message"),
     [
-        ('source = "relative"', "absolute Dropbox"),
-        ('source = "/a/../b"', "relative path"),
-        ('source = "/a//b"', "relative path"),
-        ('source = "/a/"', "relative path"),
-        ('source = "/a/./b"', "relative path"),
+        ('source = "relative"', "named rclone remote"),
+        ('source = "dropbox:a/../b"', "relative path"),
+        ('source = "dropbox:a//b"', "relative path"),
+        ('source = "dropbox:a/"', "relative path"),
+        ('source = "dropbox:a/./b"', "relative path"),
         ("source = 42", "nonempty"),
         ('source = ""', "nonempty"),
         ('destination = "relative"', "absolute local"),
@@ -103,7 +103,7 @@ def test_copy_settings_are_validated(tmp_path: Path, field: str, message: str) -
         load_config(path)
 
 
-@pytest.mark.parametrize("settings", ["", 'source = "/"', 'destination = "/photos"'])
+@pytest.mark.parametrize("settings", ["", 'source = "dropbox:"', 'destination = "/photos"'])
 def test_enabled_chain_requires_source_and_destination(tmp_path: Path, settings: str) -> None:
     path = tmp_path / "config.toml"
     path.write_text('[[chains]]\nname = "test"\nenabled = true\n' + settings)
@@ -114,50 +114,50 @@ def test_enabled_chain_requires_source_and_destination(tmp_path: Path, settings:
 def test_root_source_and_unicode_destination(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[[chains]]\nname = "test"\nenabled = true\nsource = "/"\n'
+        '[[chains]]\nname = "test"\nenabled = true\nsource = "dropbox:"\n'
         'destination = "/photos/Фото"\nsubdirectory = "Камера/__raw__"\n'
         'recursive = false\ndate_source = "modified"',
         encoding="utf-8",
     )
     chain = load_config(path).chains[0]
-    assert chain.source == "/"
+    assert chain.source == "dropbox:"
     assert chain.destination == Path("/photos/Фото")
     assert chain.subdirectory == "Камера/__raw__"
     assert chain.recursive is False
     assert chain.date_source == "modified"
 
 
-def test_credentials_path_is_relative_to_config_not_cwd(tmp_path: Path, monkeypatch) -> None:
+def test_rclone_config_path_is_relative_to_config_not_cwd(tmp_path: Path, monkeypatch) -> None:
     folder = tmp_path / "config-dir"
     folder.mkdir()
     path = folder / "settings.toml"
-    path.write_text('[dropbox]\ncredentials_file = "private/token.json"')
+    path.write_text('[rclone]\nconfig_file = "private/token.json"')
     monkeypatch.chdir(tmp_path)
-    assert load_config(path).credentials_file == folder / "private/token.json"
+    assert load_config(path).rclone_config == folder / "private/token.json"
 
 
-def test_default_credentials_path(tmp_path: Path) -> None:
+def test_default_rclone_config_path(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text("")
-    assert load_config(path).credentials_file == tmp_path / ".secrets/dropbox.json"
+    assert load_config(path).rclone_config is None
 
 
-def test_absolute_credentials_path(tmp_path: Path) -> None:
+def test_absolute_rclone_config_path(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
-    path.write_text('[dropbox]\ncredentials_file = "/private/token.json"')
-    assert load_config(path).credentials_file == Path("/private/token.json")
+    path.write_text('[rclone]\nconfig_file = "/private/token.json"')
+    assert load_config(path).rclone_config == Path("/private/token.json")
 
 
 @pytest.mark.parametrize(
     "content",
     [
-        'dropbox = "wrong"',
-        "[dropbox]\ncredentials_file = 42",
-        '[dropbox]\ncredentials_file = ""',
-        '[dropbox]\nrefresh_token = "secret"',
+        'rclone = "wrong"',
+        "[rclone]\nconfig_file = 42",
+        '[rclone]\nconfig_file = ""',
+        '[rclone]\nrefresh_token = "secret"',
     ],
 )
-def test_invalid_dropbox_settings(tmp_path: Path, content: str) -> None:
+def test_invalid_rclone_settings(tmp_path: Path, content: str) -> None:
     path = tmp_path / "config.toml"
     path.write_text(content)
     with pytest.raises(ConfigError):
@@ -168,3 +168,10 @@ def test_committed_example_is_valid_and_disabled() -> None:
     config = load_config(Path(__file__).parents[1] / "config.example.toml")
     assert config.chains
     assert all(not chain.enabled for chain in config.chains)
+
+
+def test_old_dropbox_settings_have_migration_message(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[dropbox]\n")
+    with pytest.raises(ConfigError, match=r"Replace \[dropbox\]"):
+        load_config(path)

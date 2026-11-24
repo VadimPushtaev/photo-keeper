@@ -1,151 +1,102 @@
 # Photo Keeper
 
-A Poetry-based Python application for copying photos and other media through named chains.
-Each invocation runs one chain and exits, so cron can manage scheduling. The first supported
-chain copies Dropbox files into local folders grouped by year. It does not delete or modify
-anything in Dropbox.
+Photo Keeper copies photos and other files from named rclone remotes into a local archive
+organized by year. Each invocation runs one chain, so cron can manage scheduling.
 
 ## Setup
 
-Requires Python 3.12+, Poetry 2.x, and Linux or WSL. The destination filesystem must support
-file locks and hard links, which prevent overlapping runs and publish complete files without
-overwriting existing data.
+Use Python 3.12+, Poetry 2.x, and rclone on Linux or WSL. Capture date mode also needs
+[ExifTool](https://exiftool.org/) on PATH (`libimage-exiftool-perl` on Ubuntu).
+The destination root must exist on a filesystem that supports file locks and hard links.
 
 ```bash
 poetry install
-cp config.example.toml config.toml
+cp -n config.example.toml config.toml
+poetry run photo-keeper login
 ```
 
-Edit `config.toml` with your source, destination, and folder name, then enable the chain.
-The destination root must already exist. Poetry creates the virtual environment in `.venv/`.
-Personal chains belong in the ignored `config.toml`; credentials belong in the ignored
-`.secrets/` directory. Commit application code, tests, and `poetry.lock`.
+The login command opens the interactive `rclone config` menu. Create a remote named
+`dropbox`, choose Dropbox storage, leave the app key and secret blank, and authorize it in
+your browser. If you already configured a remote, use its name in the chain. Other clouds
+use the same setup flow with their respective storage type. [Dropbox setup](https://rclone.org/dropbox/)
+and [headless login](https://rclone.org/remote_setup/).
 
-## Dropbox login
+Rclone stores and refreshes its credentials. It uses its standard config location by default.
+To use a specific file, add `[rclone]` with `config_file = ".secrets/rclone.conf"` to
+`config.toml`. Both `login` and `run` use that file. Relative paths are resolved from the
+Photo Keeper config. Keep personal chains and credentials in the ignored `config.toml` and
+`.secrets/` directory.
 
-First create your own app in the [Dropbox App Console](https://www.dropbox.com/developers/apps).
-Choose **Full Dropbox** access so it can read an existing folder such as Camera Uploads;
-an App Folder app cannot read folders elsewhere in your Dropbox. Enable these permissions:
-
-- `account_info.read`
-- `files.metadata.read`
-- `files.content.read`
-
-Copy the **App key** from the app's settings, then run:
-
-```bash
-poetry run photo-keeper login dropbox --app-key YOUR_APP_KEY
-```
-
-Open the printed authorization URL, approve access, and paste the authorization code into
-the terminal. The command also tries to open your browser. Use `--no-browser` on a headless
-machine; the printed URL can be opened in another browser. The code prompt hides your input.
-If your app settings expose an option for public clients/PKCE, allow it.
-
-Login uses [Dropbox's PKCE flow with offline access](https://docs.dropboxapi.com/dropbox-api/docs/oauth).
-It needs no app secret or redirect URL. The command verifies the account and saves the app key
-and refresh token in `.secrets/dropbox.json`, with owner-only file permissions. The SDK then
-refreshes short-lived access tokens automatically for cron runs. Tokens are never printed.
-Log in again if access is revoked. `DROPBOX_APP_KEY` can supply the app key instead of the flag.
-
-Use `--config /path/to/config.toml` before `login` to select another configuration. A custom
-`[dropbox].credentials_file` is respected. Login also works before a configuration exists.
-`login --credentials-file /path/to/token.json` overrides the save location; configure the same
-path for subsequent runs and keep it out of version control.
+If upgrading from direct Dropbox access, remove the old `[dropbox]` table, change
+`source = "/Camera Uploads"` to `source = "dropbox:Camera Uploads"`, and authorize the remote
+in rclone. The previous app credentials are separate from rclone's login.
 
 ## Chain configuration
 
 ```toml
-[dropbox]
-credentials_file = ".secrets/dropbox.json"
-
 [[chains]]
 name = "example"
 enabled = true
-source = "/Camera Uploads"
+source = "dropbox:Camera Uploads"
 destination = "/absolute/path/to/photos"
 subdirectory = "phone/__raw__"
 recursive = true
 date_source = "capture"
 ```
 
-A file `/Camera Uploads/trip/image.jpg` captured in 2024 is copied to
-`/absolute/path/to/photos/2024/phone/__raw__/trip/image.jpg`. Source subdirectories are preserved.
-All downloadable files are copied, including videos, RAW files, and sidecars, regardless of
-extension. Dropbox-native documents that cannot be downloaded are reported as ignored.
+A file `Camera Uploads/trip/image.jpg` captured in 2024 is copied to
+`/absolute/path/to/photos/2024/phone/__raw__/trip/image.jpg`. The chain copies files of any
+type and preserves source subfolders. Use `remote:` to start at a remote's root. Each named
+chain needs its own table. `enabled` defaults to false, `recursive` to true, and
+`subdirectory` to `__raw__`.
 
-`date_source = "capture"` uses the photo/video capture timestamp supplied by Dropbox. If that
-metadata is missing or still pending, the year comes from Dropbox's `client_modified` timestamp
-(the file's modification date). This fallback is logged. Years use Dropbox's timestamps without
-converting to the machine's timezone. The Dropbox upload date and current date are not used.
-Capture metadata is requested separately using
-[`files/get_metadata`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-metadata);
-folder listings no longer supply it. Set `date_source = "modified"` to use modification dates
-directly. Embedded metadata is not parsed locally.
+ExifTool reads capture dates from the file's photo or video metadata. The year falls back to
+the remote modification date when no capture date is available. A file with neither date is
+reported as a failure. Set `date_source = "modified"` to use modification dates directly and
+skip ExifTool.
 
-Add another `[[chains]]` table for another chain. Names must be unique; `enabled` defaults to
-`false`. Enabled chains require explicit `source` and `destination` values. `source = "/"`
-means all of Dropbox. `recursive` defaults to `true`, and `subdirectory` defaults to `__raw__`.
-Unknown configuration keys and unsafe paths are rejected. Relative credential paths are
-resolved against the configuration file, so cron's working directory does not affect them.
-
-## Run and inspect
+## Run
 
 ```bash
-poetry run photo-keeper --config config.toml check-config
-poetry run photo-keeper --config config.toml list-chains
-poetry run photo-keeper --config config.toml run example --dry-run
-poetry run photo-keeper --config config.toml run example
+poetry run photo-keeper check-config
+poetry run photo-keeper list-chains
+poetry run photo-keeper run example --dry-run
+poetry run photo-keeper run example
 ```
 
-Dry runs read Dropbox metadata and check existing local files, but do not download content or
-write local files. They require login. Each real run enumerates the configured source again;
-there is no persisted Dropbox cursor or local database yet.
+Dry runs list the remote and check existing files without downloading or writing files.
+Capture date mode can confirm the year from an existing verified copy. For new files, the
+exact year is determined after download.
 
-Downloads are streamed to temporary sibling files, checked for size and
-[Dropbox content hash](https://docs.dropboxapi.com/dropbox-api/docs/technical-reference/content-hash),
-flushed to disk, and published only after verification. The requested revision is pinned for
-both capture metadata and download. Local modification times are preserved.
+Rclone downloads each file into a temporary directory on the destination drive. Photo Keeper
+checks the expected size and supported remote checksum before publishing the copy. Backends
+without a supported checksum may need to download the file again on subsequent runs so its
+contents can be compared locally. A matching file is skipped. If a destination filename
+contains different content, the new copy receives a deterministic checksum suffix.
 
-Existing local files are hashed before being skipped. If a filename contains different content,
-the existing file is preserved and the new copy receives a deterministic content-hash suffix.
-Subsequent runs recognize either verified filename. This is a copy operation: remote deletions
-do not remove local files, and a local file removed or moved elsewhere will be downloaded again.
-Later organization or cleanup steps will need persistent tracking before they are introduced.
+The operation only reads the cloud source. Local files survive deletion on the remote.
+Files removed or moved out of the archive may be downloaded again. Each run holds a lock
+in the destination root to prevent overlapping copies. Failed downloads are cleaned up on exit.
+An abrupt kill or power loss can leave a hidden `.photo-keeper-*` staging directory.
 
-Failed downloads are removed without publishing a partial destination. After a forced process
-kill or power failure, a hidden `.photo-keeper-*.part` file may remain; it is never treated as a
-completed copy. The next run retries the download. A persistent `.photo-keeper.lock` in the
-destination root prevents concurrent writers; the OS releases the lock when the process exits.
-Do not delete that lock file during a run. Symlinks below the destination root are rejected.
+The summary reports copied, unchanged, planned, and failed counts. Exit codes are `0` for
+success, `1` for runtime or copy failures, `2` for configuration or usage errors, and `130`
+for an interrupted run. Results go to stdout and timestamped logs go to stderr.
 
-Individual copy failures are logged and other files are still attempted. The final summary
-reports copied, unchanged, planned, ignored, and failed counts. Exit codes are `0` for success,
-`1` for authentication/I/O/copy failures, `2` for configuration or usage errors, and `130` for
-an interrupted run. Results go to stdout; timestamped logs go to stderr.
-
-For cron, use absolute executable and configuration paths, for example:
+For cron, use absolute executable and configuration paths and make sure both rclone and
+ExifTool are on cron's PATH. Run as the user who authorized the rclone remote.
 
 ```cron
-*/30 * * * * /path/to/photo-keeper/.venv/bin/photo-keeper --config /path/to/photo-keeper/config.toml run example >> /path/to/photo-keeper/logs/backup.log 2>&1
+*/30 * * * * /path/to/photo-keeper/.venv/bin/photo-keeper --config /path/to/photo-keeper/config.toml run example
 ```
-
-Create the log directory first. Scheduling remains external; the app does not install cron jobs.
 
 ## Development
 
 ```bash
-make check   # Lint, formatting, tests with coverage, and Poetry metadata/lock validation
-make format
+make check
 make build
 ```
 
-Code lives in `src/photo_keeper/`: `auth.py` handles login and credential storage, `config.py`
-validates settings, `backup.py` runs verified copies, and `hashing.py` implements Dropbox's hash.
-The CLI is also available through `poetry run python -m photo_keeper`.
-
-Tests run offline and block unexpected network access. They cover configuration, PKCE login,
-refresh tokens, pagination, photo/video date selection, content verification across block
-boundaries, Unicode paths, repeat runs, conflicts, symlinks, interrupted transfers, full disks,
-concurrent runs, and CLI exit codes. Integration tests exercise the real Dropbox SDK against
-simulated HTTP responses. No tests require an account or touch a personal media directory.
+The tests cover rclone arguments and output parsing, capture dates, checksum verification,
+repeat runs, conflicts, interrupted downloads, and CLI errors. The integration test uses
+actual rclone and ExifTool with a local fixture and skips if either program is unavailable.

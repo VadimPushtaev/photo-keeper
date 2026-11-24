@@ -1,5 +1,6 @@
-"""Validated configuration for Dropbox copy chains."""
+"""Validated configuration for rclone copy chains."""
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -23,7 +24,7 @@ class ChainConfig:
 @dataclass(frozen=True)
 class AppConfig:
     chains: tuple[ChainConfig, ...] = ()
-    credentials_file: Path = Path(".secrets/dropbox.json")
+    rclone_config: Path | None = None
 
 
 def _text(value: object, label: str) -> str:
@@ -56,19 +57,21 @@ def load_config(path: Path) -> AppConfig:
     except (OSError, ValueError) as exc:
         raise ConfigError(f"Cannot load {path}: {exc}") from exc
 
-    if unknown := data.keys() - {"chains", "dropbox"}:
+    if "dropbox" in data:
+        raise ConfigError("Replace [dropbox] with rclone configuration. See the README.")
+    if unknown := data.keys() - {"chains", "rclone"}:
         raise ConfigError(f"Unknown configuration keys: {', '.join(sorted(unknown))}")
 
-    dropbox = data.get("dropbox", {})
-    if not isinstance(dropbox, dict):
-        raise ConfigError("'dropbox' must be a table.")
-    if unknown := dropbox.keys() - {"credentials_file"}:
-        raise ConfigError(f"Unknown Dropbox keys: {', '.join(sorted(unknown))}")
-    credentials_file = Path(
-        _text(dropbox.get("credentials_file", ".secrets/dropbox.json"), "credentials_file")
-    ).expanduser()
-    if not credentials_file.is_absolute():
-        credentials_file = path.resolve().parent / credentials_file
+    rclone = data.get("rclone", {})
+    if not isinstance(rclone, dict):
+        raise ConfigError("'rclone' must be a table.")
+    if unknown := rclone.keys() - {"config_file"}:
+        raise ConfigError(f"Unknown rclone keys: {', '.join(sorted(unknown))}")
+    rclone_config = None
+    if "config_file" in rclone:
+        rclone_config = Path(_text(rclone["config_file"], "config_file")).expanduser()
+        if not rclone_config.is_absolute():
+            rclone_config = path.resolve().parent / rclone_config
 
     raw_chains = data.get("chains", [])
     if not isinstance(raw_chains, list):
@@ -102,10 +105,11 @@ def load_config(path: Path) -> AppConfig:
         source = raw_chain.get("source")
         if source is not None:
             source = _text(source, f"{label} source")
-            if not source.startswith("/") or "\\" in source:
-                raise ConfigError(f"{label} source must be an absolute Dropbox path (or '/').")
-            if source != "/":
-                _relative_path(source[1:], f"{label} source")
+            remote, separator, folder = source.partition(":")
+            if not separator or not re.fullmatch(r"[\w][\w .-]*", remote) or remote.endswith(" "):
+                raise ConfigError(f"{label} source must be a named rclone remote (remote:path).")
+            if folder not in ("", "/"):
+                _relative_path(folder.removeprefix("/"), f"{label} source")
 
         destination = raw_chain.get("destination")
         if destination is not None:
@@ -136,4 +140,4 @@ def load_config(path: Path) -> AppConfig:
         )
         names.add(name)
 
-    return AppConfig(chains=tuple(chains), credentials_file=credentials_file)
+    return AppConfig(chains=tuple(chains), rclone_config=rclone_config)

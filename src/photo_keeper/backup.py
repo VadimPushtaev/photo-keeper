@@ -1,25 +1,22 @@
-"""One-shot, verified Dropbox copies. No remote write or deletion operations."""
+"""Sort verified rclone downloads into the local archive."""
 
 import fcntl
+import hashlib
 import logging
 import os
-import re
 import stat
 import tempfile
 from collections.abc import Iterator
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC
 from pathlib import Path
 
-import dropbox
-from dropbox.exceptions import DropboxException
-from dropbox.files import FileMetadata
-from requests.exceptions import RequestException
-
 from photo_keeper.config import ChainConfig
 from photo_keeper.errors import KeeperError
-from photo_keeper.hashing import DropboxHasher, hash_file
+from photo_keeper.hashing import hash_file as dropbox_hash
+from photo_keeper.media import capture_year
+from photo_keeper.rclone import Rclone, RemoteFile
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +26,6 @@ class RunResult:
     copied: int = 0
     unchanged: int = 0
     planned: int = 0
-    ignored: int = 0
     failed: int = 0
 
 
@@ -48,59 +44,6 @@ def destination_lock(root: Path) -> Iterator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def iter_files(client: dropbox.Dropbox, source: str, recursive: bool) -> Iterator[FileMetadata]:
-    page = client.files_list_folder(
-        "" if source == "/" else source, recursive=recursive, include_deleted=False
-    )
-    while True:
-        for entry in page.entries:
-            if isinstance(entry, FileMetadata):
-                yield entry
-        if not page.has_more:
-            break
-        page = client.files_list_folder_continue(page.cursor)
-
-
-def relative_path(entry: FileMetadata, source: str) -> Path:
-    """Preserve source subdirectories and reject paths that can escape the destination."""
-    remote = entry.path_display or entry.path_lower
-    if not remote or not remote.startswith("/"):
-        raise KeeperError("Dropbox returned a file without an absolute path.")
-    parts = remote[1:].split("/")
-    if any(
-        part in {"", ".", ".."}
-        or "\\" in part
-        or ":" in part
-        or any(ord(char) < 32 for char in part)
-        for part in parts
-    ):
-        raise KeeperError("Dropbox returned an unsafe file path.")
-    source_parts = source.strip("/").split("/") if source != "/" else []
-    if len(parts) <= len(source_parts) or [part.lower() for part in parts[: len(source_parts)]] != [
-        part.lower() for part in source_parts
-    ]:
-        raise KeeperError("Dropbox returned a file outside the configured source.")
-    return Path(*parts[len(source_parts) :])
-
-
-def destination_year(client: dropbox.Dropbox, entry: FileMetadata, date_source: str) -> int:
-    if date_source == "capture":
-        metadata = client.files_get_metadata(f"rev:{entry.rev}", include_media_info=True)
-        if (
-            not isinstance(metadata, FileMetadata)
-            or metadata.rev != entry.rev
-            or metadata.id != entry.id
-        ):
-            raise KeeperError("Dropbox returned metadata for a different file revision.")
-        media = metadata.media_info
-        if media is not None and media.is_metadata():
-            taken = media.get_metadata().time_taken
-            if taken is not None:
-                return taken.year
-        logger.info("No capture date for %r; using client modification date.", entry.path_display)
-    return entry.client_modified.year
-
-
 def safe_path(root: Path, path: Path) -> None:
     """Refuse symlinks below the configured root, including broken symlinks."""
     try:
@@ -116,112 +59,178 @@ def safe_path(root: Path, path: Path) -> None:
             raise KeeperError(f"Refusing destination symlink: {current}")
 
 
-def same_content(path: Path, entry: FileMetadata) -> bool:
+def _digest(client: Rclone, path: Path, kind: str) -> str:
+    if kind == "dropbox":
+        return dropbox_hash(path)
+    if kind == "quickxor":
+        return client.quickxor(path)
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, kind).hexdigest()
+
+
+def _existing_size(path: Path) -> int | None:
     try:
         info = path.lstat()
     except FileNotFoundError:
-        return False
+        return None
     if not stat.S_ISREG(info.st_mode):
         raise KeeperError(f"Destination is not a regular file: {path}")
-    return info.st_size == entry.size and hash_file(path) == entry.content_hash
+    return info.st_size
 
 
-def choose_target(root: Path, target: Path, entry: FileMetadata) -> tuple[Path, bool]:
+def _alternate(target: Path, digest: str) -> Path:
+    name = f"{target.stem}--{digest}{target.suffix}"
+    if len(name.encode()) > 255:
+        # Preserve a normal extension and distinguish long names sharing a prefix.
+        suffix = target.suffix.encode()[:32].decode(errors="ignore")
+        name_hash = hashlib.sha256(target.name.encode()).hexdigest()[:12]
+        ending = f"--{name_hash}--{digest}{suffix}"
+        stem = target.stem.encode()[: 255 - len(ending.encode())].decode(errors="ignore")
+        name = stem + ending
+    return target.with_name(name)
+
+
+def _choose_target(
+    client: Rclone, root: Path, target: Path, size: int, checksum: tuple[str, str]
+) -> tuple[Path, bool]:
+    kind, digest = checksum
+    alternate = _alternate(target, digest)
     safe_path(root, target)
-    if same_content(target, entry):
+    original_size = _existing_size(target)
+    if original_size == size and _digest(client, target, kind) == digest:
         return target, True
-    if not target.exists():
-        return target, False
-    # Preserve both versions; a stable suffix also makes subsequent runs idempotent.
-    alternate = target.with_name(f"{target.stem}--{entry.content_hash}{target.suffix}")
+    # Check the alternate too, since the original could have been moved out of the archive.
     safe_path(root, alternate)
-    if same_content(alternate, entry):
+    alternate_size = _existing_size(alternate)
+    if alternate_size == size and _digest(client, alternate, kind) == digest:
         return alternate, True
-    if alternate.exists():
+    if original_size is None:
+        return target, False
+    if alternate_size is not None:
         raise KeeperError(f"Conflicting content already exists at {alternate}")
     return alternate, False
 
 
-def download_verified(client: dropbox.Dropbox, entry: FileMetadata, target: Path) -> None:
-    """Stream into a sibling temp file, verify, and atomically publish without overwriting."""
-    fd, name = tempfile.mkstemp(prefix=".photo-keeper-", suffix=".part", dir=target.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(fd, "wb") as file:
-            metadata, response = client.files_download(f"rev:{entry.rev}")
-            with closing(response):
-                if (
-                    metadata.id != entry.id
-                    or metadata.rev != entry.rev
-                    or metadata.size != entry.size
-                    or metadata.content_hash != entry.content_hash
-                ):
-                    raise KeeperError("Dropbox returned a different file revision during download.")
-                hasher = DropboxHasher()
-                size = 0
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    size += len(chunk)
-                    if size > entry.size:
-                        raise KeeperError("Download exceeds the expected file size.")
-                    file.write(chunk)
-                    hasher.update(chunk)
-                if size != entry.size or hasher.hexdigest() != entry.content_hash:
-                    raise KeeperError("Download failed size or content-hash verification.")
-            file.flush()
-            os.fsync(file.fileno())
-        modified = entry.client_modified
-        if modified.tzinfo is None:
-            modified = modified.replace(tzinfo=UTC)
-        os.utime(temporary, (modified.timestamp(), modified.timestamp()))
-        # link() fails if target appeared concurrently; rename() could overwrite it on Unix.
-        os.link(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+def _year(entry: RemoteFile, date_source: str, path: Path) -> int:
+    if date_source == "capture" and (year := capture_year(path)) is not None:
+        return year
+    if entry.modified is None:
+        raise KeeperError(f"No usable date for {entry.path}.")
+    return entry.modified.year
 
 
-def run_chain(client: dropbox.Dropbox, chain: ChainConfig, *, dry_run: bool = False) -> RunResult:
+def _target(root: Path, chain: ChainConfig, entry: RemoteFile, year: int) -> Path:
+    return root / f"{year:04d}" / chain.subdirectory / entry.path
+
+
+def _find_existing(
+    client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, years: set[int]
+) -> Path | None:
+    if entry.checksum is None or entry.size < 0:
+        return None
+    if chain.date_source == "modified":
+        if entry.modified is None:
+            raise KeeperError(f"No usable date for {entry.path}.")
+        target = _target(root, chain, entry, entry.modified.year)
+        target, unchanged = _choose_target(client, root, target, entry.size, entry.checksum)
+        return target if unchanged else None
+
+    kind, digest = entry.checksum
+    for year in sorted(years):
+        target = _target(root, chain, entry, year)
+        for candidate in (target, _alternate(target, digest)):
+            # Unrelated years can have an unrelated directory or symlink at this name.
+            try:
+                safe_path(root, candidate)
+                size = _existing_size(candidate)
+            except (KeeperError, NotADirectoryError):
+                continue
+            if size == entry.size and _digest(client, candidate, kind) == digest:
+                if _year(entry, chain.date_source, candidate) == year:
+                    return candidate
+    return None
+
+
+def _copy_file(
+    client: Rclone, root: Path, chain: ChainConfig, source: str, entry: RemoteFile
+) -> tuple[Path, bool, int]:
+    with tempfile.TemporaryDirectory(prefix=".photo-keeper-", dir=root) as folder:
+        staged = Path(folder) / entry.path.name
+        client.download(source, entry, staged)
+        size = _existing_size(staged)
+        if size is None or (entry.size >= 0 and size != entry.size):
+            raise KeeperError("Download failed size verification.")
+        checksum = entry.checksum
+        if checksum is None:
+            checksum = ("sha256", _digest(client, staged, "sha256"))
+        elif _digest(client, staged, checksum[0]) != checksum[1]:
+            raise KeeperError("Download failed checksum verification.")
+
+        year = _year(entry, chain.date_source, staged)
+        target = _target(root, chain, entry, year)
+        target, unchanged = _choose_target(client, root, target, size, checksum)
+        if not unchanged:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            safe_path(root, target)
+            if entry.modified is not None:
+                modified = entry.modified
+                if modified.tzinfo is None:
+                    modified = modified.replace(tzinfo=UTC)
+                os.utime(staged, (modified.timestamp(), modified.timestamp()))
+            with staged.open("rb") as file:
+                os.fsync(file.fileno())
+            os.link(staged, target)  # Fails if the target appeared concurrently.
+        return target, unchanged, year
+
+
+def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> RunResult:
     if not chain.enabled:
         raise KeeperError(f"Chain {chain.name!r} is disabled.")
     if chain.source is None or chain.destination is None:
         raise KeeperError("Chain requires a source and destination.")
-    # Do not create the root: a missing mounted drive must not become a local directory.
     if not chain.destination.is_dir():
         raise KeeperError(f"Destination root must already exist: {chain.destination}")
     root = chain.destination.resolve()
     result = RunResult()
+
     with nullcontext() if dry_run else destination_lock(root):
-        for entry in iter_files(client, chain.source, chain.recursive):
-            if not entry.is_downloadable:
-                logger.warning("Ignoring non-downloadable Dropbox document: %r", entry.path_display)
-                result.ignored += 1
-                continue
+        years = (
+            {
+                int(folder.name)
+                for folder in root.iterdir()
+                if len(folder.name) == 4
+                and folder.name.isascii()
+                and folder.name.isdecimal()
+                and not folder.is_symlink()
+                and folder.is_dir()
+            }
+            if chain.date_source == "capture"
+            else set()
+        )
+        for entry in client.list_files(chain.source, chain.recursive):
             try:
-                if not entry.content_hash or not re.fullmatch(r"[0-9a-f]{64}", entry.content_hash):
-                    raise KeeperError("Dropbox did not provide a valid content hash.")
-                relative = relative_path(entry, chain.source)
-                year = destination_year(client, entry, chain.date_source)
-                target = root / f"{year:04d}" / chain.subdirectory / relative
-                target, unchanged = choose_target(root, target, entry)
-                if unchanged:
+                existing = _find_existing(client, root, chain, entry, years)
+                if existing is not None:
                     result.unchanged += 1
-                    logger.info("Already verified: %s", target)
+                    logger.info("Already verified: %s", existing)
                 elif dry_run:
+                    if chain.date_source == "modified":
+                        year = _year(entry, chain.date_source, root)
+                        target = _target(root, chain, entry, year)
+                        logger.info("Would check and copy %s into %s", entry.path, target.parent)
+                    else:
+                        logger.info("Would download %s to check its capture year.", entry.path)
                     result.planned += 1
-                    logger.info("Would copy %r to %s", entry.path_display, target)
                 else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    safe_path(root, target)
-                    download_verified(client, entry, target)
-                    result.copied += 1
-                    logger.info("Copied %r to %s", entry.path_display, target)
-            except (KeeperError, OSError, DropboxException, RequestException) as exc:
+                    target, unchanged, year = _copy_file(client, root, chain, chain.source, entry)
+                    years.add(year)
+                    if unchanged:
+                        result.unchanged += 1
+                        logger.info("Already verified: %s", target)
+                    else:
+                        result.copied += 1
+                        logger.info("Copied %s to %s", entry.path, target)
+            except (KeeperError, OSError) as exc:
                 result.failed += 1
-                detail = (
-                    type(exc).__name__
-                    if isinstance(exc, (DropboxException, RequestException))
-                    else str(exc)
-                )
-                logger.error("Cannot copy %r: %s", entry.path_display, detail)
+                logger.error("Cannot copy %s: %s", entry.path, exc)
     return result
