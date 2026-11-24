@@ -10,7 +10,7 @@ from photo_keeper.backup import run_chain
 from photo_keeper.config import DeletionConfig
 from photo_keeper.errors import KeeperError
 from photo_keeper.media import MediaInfo
-from photo_keeper.organize import clean_raw, sort_raw
+from photo_keeper.organize import clean_raw, process_local
 from photo_keeper.rclone import RemoteFile, holding_area
 
 
@@ -189,12 +189,8 @@ def test_dry_run_only_plans_actions_whose_prerequisites_currently_exist(remote, 
 @pytest.mark.parametrize("reason", ["same name", "same bytes", "unknown checksum", "unknown size"])
 def test_raw_cleanup_retains_uncertain_or_present_upstream_files(remote, monthly, reason):
     raw = raw_file(monthly, data=b"media")
-    (sorted_copy,) = sort_raw(
-        remote,
-        monthly.destination,
-        monthly,
-        [2025],
-        dry_run=False,
+    (sorted_copy,) = process_local(
+        remote, monthly.resolved_steps()[1], monthly.resolved_steps()[0].outputs, dry_run=False
     ).copies
     options = {
         "same name": ("picture.heic", b"different", {}),
@@ -204,7 +200,7 @@ def test_raw_cleanup_retains_uncertain_or_present_upstream_files(remote, monthly
     }
     name, content, kwargs = options[reason]
     entry = remote.add(name, content, **kwargs)
-    assert clean_raw(remote, monthly.destination, [sorted_copy], [entry], dry_run=False) == (
+    assert clean_raw(remote, [sorted_copy], [entry], dry_run=False) == (
         0,
         0,
         0,
@@ -215,15 +211,11 @@ def test_raw_cleanup_retains_uncertain_or_present_upstream_files(remote, monthly
 @pytest.mark.parametrize("side", ["raw", "archive"])
 def test_raw_cleanup_requires_fresh_matching_contents(remote, monthly, side):
     raw_file(monthly, data=b"backup")
-    (sorted_copy,) = sort_raw(
-        remote,
-        monthly.destination,
-        monthly,
-        [2025],
-        dry_run=False,
+    (sorted_copy,) = process_local(
+        remote, monthly.resolved_steps()[1], monthly.resolved_steps()[0].outputs, dry_run=False
     ).copies
     getattr(sorted_copy, side).write_bytes(b"edited")
-    assert clean_raw(remote, monthly.destination, [sorted_copy], [], dry_run=False) == (0, 0, 1)
+    assert clean_raw(remote, [sorted_copy], [], dry_run=False) == (0, 0, 1)
     assert sorted_copy.raw.exists()
     assert sorted_copy.archive.exists()
 
@@ -296,15 +288,11 @@ def test_raw_cleanup_accepts_same_size_when_checksums_prove_it_is_a_different_ob
     remote, monthly
 ):
     raw_file(monthly, data=b"media")
-    (sorted_copy,) = sort_raw(
-        remote,
-        monthly.destination,
-        monthly,
-        [2025],
-        dry_run=False,
+    (sorted_copy,) = process_local(
+        remote, monthly.resolved_steps()[1], monthly.resolved_steps()[0].outputs, dry_run=False
     ).copies
     other = remote.add("other.heic", b"other", checksum=("md5", "1" * 32))
-    assert clean_raw(remote, monthly.destination, [sorted_copy], [other], dry_run=False) == (
+    assert clean_raw(remote, [sorted_copy], [other], dry_run=False) == (
         1,
         0,
         0,

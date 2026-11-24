@@ -1,20 +1,27 @@
-"""Sort verified rclone downloads into the local archive."""
+"""Run ordered copy and sort steps and verify their cleanup conditions."""
 
 import fcntl
 import logging
 import os
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC
 from itertools import batched
 from pathlib import Path
 
-from photo_keeper.config import ChainConfig
+from photo_keeper.config import ChainConfig, StepConfig
 from photo_keeper.errors import KeeperError
-from photo_keeper.media import capture_year
-from photo_keeper.organize import clean_raw, sort_raw
+from photo_keeper.layout import Layout
+from photo_keeper.media import capture_year, read_media_info
+from photo_keeper.organize import (
+    SortedCopy,
+    UpstreamFiles,
+    clean_raw,
+    local_snapshot,
+    process_local,
+)
 from photo_keeper.rclone import Rclone, RemoteFile, holding_area
 from photo_keeper.storage import _alternate, _choose_target, _digest, _existing_size, safe_path
 
@@ -65,32 +72,31 @@ def destination_lock(root: Path) -> Iterator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _year(entry: RemoteFile, date_source: str, path: Path) -> int:
-    if date_source == "capture" and (year := capture_year(path)) is not None:
-        return year
-    if entry.modified is None:
-        raise KeeperError(f"No usable date for {entry.path}.")
-    return entry.modified.year
-
-
-def _target(root: Path, chain: ChainConfig, entry: RemoteFile, year: int) -> Path:
-    return root / f"{year:04d}" / chain.subdirectory / entry.path
+def _target(step: StepConfig, entry: RemoteFile, path: Path) -> Path:
+    output = step.destination
+    if not output.fields:
+        return output.path / entry.path
+    year = month = None
+    if step.date_source == "capture":
+        if "{month}" in output.fields:
+            captured = read_media_info(path).capture_date
+            if captured is not None:
+                year, month = captured.year, captured.month
+        else:
+            year = capture_year(path)
+    if year is None:
+        if entry.modified is None:
+            raise KeeperError(f"No usable date for {entry.path}.")
+        year, month = entry.modified.year, entry.modified.month
+    return output.render(year, month or 1) / entry.path
 
 
 class ArchiveLookup:
     """Cache each relevant archive directory's names for the planning pass."""
 
-    def __init__(self, root: Path):
-        self.root = root
-        with os.scandir(root) as folders:
-            self.years = sorted(
-                int(folder.name)
-                for folder in folders
-                if len(folder.name) == 4
-                and folder.name.isascii()
-                and folder.name.isdecimal()
-                and folder.is_dir(follow_symlinks=False)
-            )
+    def __init__(self, layout: Layout):
+        self.root = layout.root
+        self.folders = list(layout.folders())
         self._names: dict[Path, set[str]] = {}
 
     def contains(self, path: Path) -> bool:
@@ -108,20 +114,18 @@ class ArchiveLookup:
 
 
 def _find_existing(
-    client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, archive: ArchiveLookup
+    client: Rclone, root: Path, step: StepConfig, entry: RemoteFile, archive: ArchiveLookup
 ) -> Path | None:
     if entry.checksum is None or entry.size < 0:
         return None
-    if chain.date_source == "modified":
-        if entry.modified is None:
-            raise KeeperError(f"No usable date for {entry.path}.")
-        target = _target(root, chain, entry, entry.modified.year)
+    if step.date_source == "modified" or not step.destination.fields:
+        target = _target(step, entry, root)
         target, unchanged = _choose_target(client, root, target, entry.size, entry.checksum)
         return target if unchanged else None
 
     kind, digest = entry.checksum
-    for year in archive.years:
-        target = _target(root, chain, entry, year)
+    for folder in archive.folders:
+        target = folder.path / entry.path
         for candidate in (target, _alternate(target, digest)):
             if not archive.contains(candidate):
                 continue
@@ -132,13 +136,13 @@ def _find_existing(
             except (KeeperError, NotADirectoryError):
                 continue
             if size == entry.size and _digest(client, candidate, kind) == digest:
-                if _year(entry, chain.date_source, candidate) == year:
+                if _target(step, entry, candidate) == target:
                     return candidate
     return None
 
 
 def _publish_file(
-    client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, staged: Path
+    client: Rclone, root: Path, step: StepConfig, entry: RemoteFile, staged: Path
 ) -> tuple[Path, bool, int]:
     size = _existing_size(staged)
     if size is None:
@@ -151,8 +155,7 @@ def _publish_file(
     elif _digest(client, staged, checksum[0]) != checksum[1]:
         raise KeeperError("Download failed checksum verification.")
 
-    year = _year(entry, chain.date_source, staged)
-    target = _target(root, chain, entry, year)
+    target = _target(step, entry, staged)
     target, unchanged = _choose_target(client, root, target, size, checksum)
     if not unchanged:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -193,7 +196,7 @@ def _log_batch(entries: tuple[RemoteFile, ...], number: int, count: int) -> None
 def _copy_batch(
     client: Rclone,
     root: Path,
-    chain: ChainConfig,
+    step: StepConfig,
     source: str,
     entries: tuple[RemoteFile, ...],
     result: RunResult,
@@ -218,7 +221,7 @@ def _copy_batch(
                     )
                 staged = staging / entry.path
                 safe_path(staging, staged)
-                target, unchanged, size = _publish_file(client, root, chain, entry, staged)
+                target, unchanged, size = _publish_file(client, root, step, entry, staged)
                 if unchanged:
                     result.unchanged += 1
                     logger.info("Already verified: %s (%s)", target, _format_size(size))
@@ -280,110 +283,188 @@ def _delete_source_batch(
 def _clean_source(
     client: Rclone,
     root: Path,
-    chain: ChainConfig,
+    step: StepConfig,
     source: str,
-    upstream: list[RemoteFile],
+    entries: list[RemoteFile],
     result: RunResult,
     *,
     dry_run: bool,
+    upstream: list[RemoteFile],
 ) -> None:
-    archive = ArchiveLookup(root)
+    archive = ArchiveLookup(step.destination)
+    earlier = UpstreamFiles(upstream)
     candidates = []
-    for entry in upstream:
+    for entry in entries:
         try:
-            raw = _find_existing(client, root, chain, entry, archive)
+            raw = _find_existing(client, root, step, entry, archive)
             if raw is None:
+                continue
+            assert entry.checksum is not None  # A verified match requires a remote checksum.
+            if earlier.contains(client, raw, entry.path, entry.size, entry.checksum):
                 continue
             if dry_run:
                 result.source_delete_planned += 1
                 logger.info(
-                    "Would delete source file %s after verifying raw copy %s", entry.path, raw
+                    "Would delete source file %s after verifying its output %s", entry.path, raw
                 )
             else:
                 candidates.append((entry, raw))
         except (KeeperError, OSError) as exc:
             result.failed += 1
-            logger.error("Cannot verify raw copy for source cleanup of %s: %s", entry.path, exc)
+            logger.error("Cannot verify output copy for source cleanup of %s: %s", entry.path, exc)
     for batch in batched(candidates, BATCH_SIZE):
         _delete_source_batch(client, root, source, batch, result)
+
+
+def _copy_remote(
+    client: Rclone, step: StepConfig, source: str, result: RunResult, *, dry_run: bool
+) -> list[RemoteFile]:
+    root = step.destination.root
+    archive = ArchiveLookup(step.destination)
+    pending = []
+    upstream = client.list_files(source, step.recursive)
+    for entry in upstream:
+        try:
+            existing = _find_existing(client, root, step, entry, archive)
+            if existing is not None:
+                result.unchanged += 1
+                logger.info("Already verified: %s (%s)", existing, _format_size(entry.size))
+            elif dry_run:
+                if step.date_source == "capture" and step.destination.fields:
+                    precision = "date" if "{month}" in step.destination.fields else "year"
+                    logger.info(
+                        "Would download %s (%s) to check its capture %s.",
+                        entry.path,
+                        _format_size(entry.size),
+                        precision,
+                    )
+                else:
+                    target = _target(step, entry, root)
+                    logger.info(
+                        "Would check and copy %s (%s) into %s",
+                        entry.path,
+                        _format_size(entry.size),
+                        target.parent,
+                    )
+                result.planned += 1
+            else:
+                pending.append(entry)
+        except (KeeperError, OSError) as exc:
+            result.failed += 1
+            logger.error("Cannot copy %s: %s", entry.path, exc)
+
+    batch_count = (len(pending) + BATCH_SIZE - 1) // BATCH_SIZE
+    for number, batch in enumerate(batched(pending, BATCH_SIZE), start=1):
+        _log_batch(batch, number, batch_count)
+        _copy_batch(client, root, step, source, batch, result)
+    return upstream
+
+
+@dataclass
+class ExecutedStep:
+    step: StepConfig
+    source: str | tuple[Layout, ...]
+    remote_files: list[RemoteFile] | None = None
+    local_copies: list[SortedCopy] | None = None
+
+    def snapshot(self, client: Rclone, *, dry_run: bool) -> list[RemoteFile]:
+        if isinstance(self.source, str):
+            if dry_run and self.remote_files is not None:
+                return self.remote_files
+            return client.list_files(self.source, self.step.recursive)
+        return list(local_snapshot(client, self.source, recursive=self.step.recursive))
+
+
+def _clean_steps(
+    client: Rclone, runs: list[ExecutedStep], result: RunResult, *, dry_run: bool
+) -> None:
+    preceding: list[ExecutedStep] = []
+    for run in runs:
+        if run.step.delete_source:
+            before = result.failed
+            upstream = [
+                entry
+                for earlier in preceding
+                for entry in earlier.snapshot(client, dry_run=dry_run)
+            ]
+            if isinstance(run.source, str):
+                entries = run.snapshot(client, dry_run=dry_run)
+                _clean_source(
+                    client,
+                    run.step.destination.root,
+                    run.step,
+                    run.source,
+                    entries,
+                    result,
+                    dry_run=dry_run,
+                    upstream=upstream,
+                )
+            elif run.local_copies:
+                deleted, planned, failed = clean_raw(
+                    client,
+                    run.local_copies,
+                    upstream,
+                    dry_run=dry_run,
+                )
+                result.raw_deleted += deleted
+                result.raw_delete_planned += planned
+                result.failed += failed
+            if result.failed > before:
+                break
+        preceding.append(run)
 
 
 def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> RunResult:
     if not chain.enabled:
         raise KeeperError(f"Chain {chain.name!r} is disabled.")
-    if chain.source is None or chain.destination is None:
-        raise KeeperError("Chain requires a source and destination.")
-    if not chain.destination.is_dir():
-        raise KeeperError(f"Destination root must already exist: {chain.destination}")
-    root = chain.destination.resolve()
+    steps = chain.resolved_steps()
+    if not steps:
+        raise KeeperError("Chain requires at least one step with a source and destination.")
+
     result = RunResult()
+    roots = {layout.root for step in steps for layout in step.outputs}
+    roots.update(
+        step.source.root for step in steps if step.delete_source and isinstance(step.source, Layout)
+    )
+    for root in roots:
+        if not root.is_dir():
+            raise KeeperError(f"Destination root must already exist: {root}")
+        safe_path(Path(root.anchor), root)
 
-    with nullcontext() if dry_run else destination_lock(root):
-        archive = ArchiveLookup(root)
-        pending = []
-        upstream = client.list_files(chain.source, chain.recursive)
-        for entry in upstream:
-            try:
-                existing = _find_existing(client, root, chain, entry, archive)
-                if existing is not None:
-                    result.unchanged += 1
-                    logger.info("Already verified: %s (%s)", existing, _format_size(entry.size))
-                elif dry_run:
-                    if chain.date_source == "modified":
-                        year = _year(entry, chain.date_source, root)
-                        target = _target(root, chain, entry, year)
-                        logger.info(
-                            "Would check and copy %s (%s) into %s",
-                            entry.path,
-                            _format_size(entry.size),
-                            target.parent,
-                        )
-                    else:
-                        logger.info(
-                            "Would download %s (%s) to check its capture year.",
-                            entry.path,
-                            _format_size(entry.size),
-                        )
-                    result.planned += 1
+    with ExitStack() as locks:
+        if not dry_run:
+            for root in sorted(roots):
+                locks.enter_context(destination_lock(root))
+
+        runs = []
+        previous: tuple[Layout, ...] = ()
+        for number, step in enumerate(steps, start=1):
+            logger.info(
+                "Step %d/%d: %s to %s", number, len(steps), step.kind, step.destination.path
+            )
+            source = step.source
+            if source == "previous":
+                source = previous
+            elif isinstance(source, Layout):
+                source = (source,)
+
+            run = ExecutedStep(step, source)
+            if isinstance(source, str):
+                run.remote_files = _copy_remote(client, step, source, result, dry_run=dry_run)
+            else:
+                copies = process_local(client, step, source, dry_run=dry_run)
+                run.local_copies = copies.copies
+                result.failed += copies.failed
+                if step.kind == "sort":
+                    result.sorted += copies.sorted
+                    result.sort_unchanged += copies.unchanged
+                    result.sort_planned += copies.planned
                 else:
-                    pending.append(entry)
-            except (KeeperError, OSError) as exc:
-                result.failed += 1
-                logger.error("Cannot copy %s: %s", entry.path, exc)
+                    result.copied += copies.sorted
+                    result.unchanged += copies.unchanged
+                    result.planned += copies.planned
+            runs.append(run)
+            previous = step.outputs
 
-        batch_count = (len(pending) + BATCH_SIZE - 1) // BATCH_SIZE
-        for number, batch in enumerate(batched(pending, BATCH_SIZE), start=1):
-            _log_batch(batch, number, batch_count)
-            _copy_batch(client, root, chain, chain.source, batch, result)
-
-        if chain.sort_by_month:
-            logger.info("Checking raw files for month sorting.")
-            sorted_files = sort_raw(
-                client,
-                root,
-                chain,
-                ArchiveLookup(root).years,
-                dry_run=dry_run,
-            )
-            result.sorted = sorted_files.sorted
-            result.sort_unchanged = sorted_files.unchanged
-            result.sort_planned = sorted_files.planned
-            result.failed += sorted_files.failed
-
-        before_source_cleanup = result.failed
-        if chain.delete.source:
-            if not dry_run:
-                upstream = client.list_files(chain.source, chain.recursive)
-            _clean_source(client, root, chain, chain.source, upstream, result, dry_run=dry_run)
-        if chain.sort_by_month and chain.delete.raw and before_source_cleanup == result.failed:
-            if not dry_run:
-                upstream = client.list_files(chain.source, chain.recursive)
-            result.raw_deleted, result.raw_delete_planned, failures = clean_raw(
-                client,
-                root,
-                sorted_files.copies,
-                upstream,
-                dry_run=dry_run,
-            )
-            result.failed += failures
+        _clean_steps(client, runs, result, dry_run=dry_run)
     return result

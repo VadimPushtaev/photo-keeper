@@ -96,10 +96,14 @@ def test_chain_sort_and_cleanup_with_a_real_local_rclone_remote(tmp_path, capfd)
     config = tmp_path / "chain.toml"
     config.write_text(
         '[rclone]\nconfig_file = "rclone.conf"\n'
-        '[[chains]]\nname = "camera"\nenabled = true\nsource = "fixture:Camera Uploads"\n'
-        f'destination = {json.dumps(str(archive))}\nsubdirectory = "phone/__raw__"\n'
-        'date_source = "modified"\nsort_by_month = true\n'
-        "[chains.delete]\nsource = true\nraw = true\narchive = true\n",
+        '[[chains]]\nname = "camera"\nenabled = true\n'
+        '[[chains.steps]]\ntype = "copy"\nfrom = { rclone = "fixture:Camera Uploads" }\n'
+        f"to = {json.dumps(str(archive / '{year}/phone/__raw__'))}\n"
+        'date_source = "modified"\ndelete_source = true\n'
+        '[[chains.steps]]\ntype = "sort"\nfrom = "previous"\n'
+        f"to = {json.dumps(str(archive / '{year}/phone/{month}'))}\n"
+        'date_source = "modified"\ndelete_source = true\n'
+        '[chains.steps.routes]\nvideo = "video"\n',
     )
     args = ["--config", str(config), "run", "camera"]
     assert main([*args, "--dry-run"]) == 0
