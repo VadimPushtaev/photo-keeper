@@ -6,6 +6,7 @@ import pytest
 
 from photo_keeper import backup
 from photo_keeper.config import ChainConfig
+from photo_keeper.errors import KeeperError
 from photo_keeper.rclone import RemoteFile
 
 
@@ -19,6 +20,7 @@ class FakeRclone:
         self.entries = []
         self.payloads = {}
         self.downloads = []
+        self.batches = []
         self.list_calls = []
 
     def add(self, path="photo.jpg", data=b"photo contents", **overrides):
@@ -37,13 +39,23 @@ class FakeRclone:
         self.list_calls.append((source, recursive))
         return self.entries
 
-    def download(self, source, entry, target):
-        self.downloads.append((source, entry.path))
-        data = self.payloads[entry.path]
-        if isinstance(data, BaseException):
-            target.write_bytes(b"partial")
-            raise data
-        target.write_bytes(data)
+    def download_batch(self, source, entries, target):
+        self.batches.append(tuple(entry.path for entry in entries))
+        failed = False
+        for entry in entries:
+            self.downloads.append((source, entry.path))
+            data = self.payloads[entry.path]
+            staged = target / entry.path
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(data, BaseException):
+                staged.write_bytes(b"partial")
+                if isinstance(data, KeyboardInterrupt):
+                    raise data
+                failed = True
+            else:
+                staged.write_bytes(data)
+        if failed:
+            raise KeeperError("rclone copy failed")
 
     def quickxor(self, path):
         assert path.is_file()

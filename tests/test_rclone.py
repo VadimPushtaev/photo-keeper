@@ -57,6 +57,7 @@ def test_listing_parses_rclone_output_and_uses_named_remote(process, tmp_path, r
         check=True,
         text=True,
         capture_output=True,
+        input=None,
     )
 
 
@@ -142,29 +143,37 @@ def test_duplicate_remote_paths_are_ambiguous(process):
 
 
 @pytest.mark.parametrize("source", ["cloud:", "cloud:/", "cloud:Camera Uploads"])
-def test_copy_passes_literal_file_paths_and_uses_copyto(process, tmp_path, source):
-    mock_listing(process, file_entry(Path="sub/a [file].jpg"))
+def test_copy_passes_literal_file_paths_in_one_batch(process, tmp_path, source):
+    mock_listing(process, file_entry(Path="sub/a [file].jpg"), file_entry(Path="#Фото.jpg "))
     client = Rclone()
-    entry = client.list_files(source, True)[0]
-    path = tmp_path / "Файл.jpg"
-    client.download(source, entry, path)
-    prefix = source if source.endswith((":", "/")) else source + "/"
-    assert process.call_args.args[0] == [
-        "rclone",
-        "copyto",
-        "--max-depth",
-        "1",
-        "--",
-        prefix + "sub/a [file].jpg",
-        str(path),
-    ]
+    entries = client.list_files(source, True)
+    client.download_batch(source, entries, tmp_path)
+    process.assert_called_with(
+        [
+            "rclone",
+            "copy",
+            "--files-from-raw",
+            "-",
+            "--no-traverse",
+            "--no-unicode-normalization",
+            "--transfers",
+            "4",
+            "--",
+            source,
+            str(tmp_path),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        input="sub/a [file].jpg\n#Фото.jpg \n",
+    )
 
 
 def test_interactive_configuration_inherits_the_terminal(process):
     process.return_value.stdout = None
     Rclone().configure()
     process.assert_called_once_with(
-        ["rclone", "config"], check=True, text=True, capture_output=False
+        ["rclone", "config"], check=True, text=True, capture_output=False, input=None
     )
 
 

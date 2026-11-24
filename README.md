@@ -66,10 +66,12 @@ poetry run photo-keeper run example
 
 Dry runs list the remote and check existing files without downloading or writing files.
 Capture date mode can confirm the year from an existing verified copy. For new files, the
-exact year is determined after download.
+exact year is determined after download. Planning reads the filenames in each relevant
+archive folder once and hashes only potential matches.
 
-Rclone downloads each file into a temporary directory on the destination drive. Photo Keeper
-checks the expected size and supported remote checksum before publishing the copy. Backends
+Rclone downloads pending files in batches of up to 16, with four transfers in parallel.
+Each batch downloads into a temporary directory on the destination drive. Photo Keeper
+checks the expected size and supported remote checksum before publishing each copy. Backends
 without a supported checksum may need to download the file again on subsequent runs so its
 contents can be compared locally. A matching file is skipped. If a destination filename
 contains different content, the new copy receives a deterministic checksum suffix.

@@ -44,7 +44,7 @@ def test_real_local_rclone_remote_and_capture_year(tmp_path, capsys, caplog):
     )
     timestamp = 1748779200  # 2025-06-01, a different year from the capture date.
     os.utime(remote_photo, (timestamp, timestamp))
-    note = inbox / "note.txt"
+    note = inbox / "# note [file].txt"
     note.write_bytes(b"sidecar")
     os.utime(note, (timestamp, timestamp))
     archive = tmp_path / "Архив"
@@ -66,6 +66,6 @@ def test_real_local_rclone_remote_and_capture_year(tmp_path, capsys, caplog):
     local_photo = archive / "2021/Камера/__raw__/Поездка/Снимок.png"
     assert local_photo.read_bytes() == remote_photo.read_bytes()
     assert local_photo.stat().st_mtime == timestamp
-    assert (archive / "2025/Камера/__raw__/note.txt").read_bytes() == b"sidecar"
+    assert (archive / "2025/Камера/__raw__/# note [file].txt").read_bytes() == b"sidecar"
     assert main(args) == 0, caplog.text
     assert "unchanged=2" in capsys.readouterr().out

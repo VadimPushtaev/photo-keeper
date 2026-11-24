@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC
+from itertools import batched
 from pathlib import Path
 
 from photo_keeper.config import ChainConfig
@@ -19,6 +20,7 @@ from photo_keeper.media import capture_year
 from photo_keeper.rclone import Rclone, RemoteFile
 
 logger = logging.getLogger(__name__)
+BATCH_SIZE = 16
 
 
 @dataclass
@@ -123,8 +125,38 @@ def _target(root: Path, chain: ChainConfig, entry: RemoteFile, year: int) -> Pat
     return root / f"{year:04d}" / chain.subdirectory / entry.path
 
 
+class ArchiveLookup:
+    """Cache each relevant archive directory's names for the planning pass."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        with os.scandir(root) as folders:
+            self.years = sorted(
+                int(folder.name)
+                for folder in folders
+                if len(folder.name) == 4
+                and folder.name.isascii()
+                and folder.name.isdecimal()
+                and folder.is_dir(follow_symlinks=False)
+            )
+        self._names: dict[Path, set[str]] = {}
+
+    def contains(self, path: Path) -> bool:
+        parent = path.parent
+        if parent not in self._names:
+            try:
+                safe_path(self.root, parent)
+                with os.scandir(parent) as entries:
+                    names = {entry.name.casefold() for entry in entries}
+            except (KeeperError, FileNotFoundError, NotADirectoryError):
+                names = set()
+            self._names[parent] = names
+        # The final stat and hash use the actual path, so this also works on NTFS.
+        return path.name.casefold() in self._names[parent]
+
+
 def _find_existing(
-    client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, years: set[int]
+    client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, archive: ArchiveLookup
 ) -> Path | None:
     if entry.checksum is None or entry.size < 0:
         return None
@@ -136,9 +168,11 @@ def _find_existing(
         return target if unchanged else None
 
     kind, digest = entry.checksum
-    for year in sorted(years):
+    for year in archive.years:
         target = _target(root, chain, entry, year)
         for candidate in (target, _alternate(target, digest)):
+            if not archive.contains(candidate):
+                continue
             # Unrelated years can have an unrelated directory or symlink at this name.
             try:
                 safe_path(root, candidate)
@@ -151,36 +185,75 @@ def _find_existing(
     return None
 
 
-def _copy_file(
-    client: Rclone, root: Path, chain: ChainConfig, source: str, entry: RemoteFile
-) -> tuple[Path, bool, int]:
-    with tempfile.TemporaryDirectory(prefix=".photo-keeper-", dir=root) as folder:
-        staged = Path(folder) / entry.path.name
-        client.download(source, entry, staged)
-        size = _existing_size(staged)
-        if size is None or (entry.size >= 0 and size != entry.size):
-            raise KeeperError("Download failed size verification.")
-        checksum = entry.checksum
-        if checksum is None:
-            checksum = ("sha256", _digest(client, staged, "sha256"))
-        elif _digest(client, staged, checksum[0]) != checksum[1]:
-            raise KeeperError("Download failed checksum verification.")
+def _publish_file(
+    client: Rclone, root: Path, chain: ChainConfig, entry: RemoteFile, staged: Path
+) -> tuple[Path, bool]:
+    size = _existing_size(staged)
+    if size is None:
+        raise KeeperError("rclone did not download the listed file.")
+    if entry.size >= 0 and size != entry.size:
+        raise KeeperError("Download failed size verification.")
+    checksum = entry.checksum
+    if checksum is None:
+        checksum = ("sha256", _digest(client, staged, "sha256"))
+    elif _digest(client, staged, checksum[0]) != checksum[1]:
+        raise KeeperError("Download failed checksum verification.")
 
-        year = _year(entry, chain.date_source, staged)
-        target = _target(root, chain, entry, year)
-        target, unchanged = _choose_target(client, root, target, size, checksum)
-        if not unchanged:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            safe_path(root, target)
-            if entry.modified is not None:
-                modified = entry.modified
-                if modified.tzinfo is None:
-                    modified = modified.replace(tzinfo=UTC)
-                os.utime(staged, (modified.timestamp(), modified.timestamp()))
-            with staged.open("rb") as file:
-                os.fsync(file.fileno())
-            os.link(staged, target)  # Fails if the target appeared concurrently.
-        return target, unchanged, year
+    year = _year(entry, chain.date_source, staged)
+    target = _target(root, chain, entry, year)
+    target, unchanged = _choose_target(client, root, target, size, checksum)
+    if not unchanged:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        safe_path(root, target)
+        if entry.modified is not None:
+            modified = entry.modified
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=UTC)
+            os.utime(staged, (modified.timestamp(), modified.timestamp()))
+        with staged.open("rb") as file:
+            os.fsync(file.fileno())
+        os.link(staged, target)  # Fails if the target appeared concurrently.
+    return target, unchanged
+
+
+def _copy_batch(
+    client: Rclone,
+    root: Path,
+    chain: ChainConfig,
+    source: str,
+    entries: tuple[RemoteFile, ...],
+    result: RunResult,
+) -> None:
+    logger.info("Downloading batch of %d files.", len(entries))
+    with tempfile.TemporaryDirectory(prefix=".photo-keeper-", dir=root) as folder:
+        staging = Path(folder)
+        batch_failed = False
+        try:
+            client.download_batch(source, entries, staging)
+        except KeeperError as exc:
+            batch_failed = True
+            logger.warning("rclone batch reported an error: %s", exc)
+
+        for entry in entries:
+            try:
+                # A failed transfer can leave a staged file behind. Match the listed
+                # checksum before publishing from a failed batch.
+                if batch_failed and entry.checksum is None:
+                    raise KeeperError(
+                        "Cannot verify this file after a failed batch without a remote checksum."
+                    )
+                staged = staging / entry.path
+                safe_path(staging, staged)
+                target, unchanged = _publish_file(client, root, chain, entry, staged)
+                if unchanged:
+                    result.unchanged += 1
+                    logger.info("Already verified: %s", target)
+                else:
+                    result.copied += 1
+                    logger.info("Copied %s to %s", entry.path, target)
+            except (KeeperError, OSError) as exc:
+                result.failed += 1
+                logger.error("Cannot copy %s: %s", entry.path, exc)
 
 
 def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> RunResult:
@@ -194,22 +267,11 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
     result = RunResult()
 
     with nullcontext() if dry_run else destination_lock(root):
-        years = (
-            {
-                int(folder.name)
-                for folder in root.iterdir()
-                if len(folder.name) == 4
-                and folder.name.isascii()
-                and folder.name.isdecimal()
-                and not folder.is_symlink()
-                and folder.is_dir()
-            }
-            if chain.date_source == "capture"
-            else set()
-        )
+        archive = ArchiveLookup(root)
+        pending = []
         for entry in client.list_files(chain.source, chain.recursive):
             try:
-                existing = _find_existing(client, root, chain, entry, years)
+                existing = _find_existing(client, root, chain, entry, archive)
                 if existing is not None:
                     result.unchanged += 1
                     logger.info("Already verified: %s", existing)
@@ -222,15 +284,11 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
                         logger.info("Would download %s to check its capture year.", entry.path)
                     result.planned += 1
                 else:
-                    target, unchanged, year = _copy_file(client, root, chain, chain.source, entry)
-                    years.add(year)
-                    if unchanged:
-                        result.unchanged += 1
-                        logger.info("Already verified: %s", target)
-                    else:
-                        result.copied += 1
-                        logger.info("Copied %s to %s", entry.path, target)
+                    pending.append(entry)
             except (KeeperError, OSError) as exc:
                 result.failed += 1
                 logger.error("Cannot copy %s: %s", entry.path, exc)
+
+        for batch in batched(pending, BATCH_SIZE):
+            _copy_batch(client, root, chain, chain.source, batch, result)
     return result

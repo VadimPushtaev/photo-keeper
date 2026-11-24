@@ -182,7 +182,7 @@ def test_bad_download_is_cleaned_up_and_other_files_still_copy(remote, chain, pa
 
 def test_success_without_a_downloaded_file_is_an_error(remote, chain, monkeypatch):
     remote.add()
-    monkeypatch.setattr(remote, "download", Mock())
+    monkeypatch.setattr(remote, "download_batch", Mock())
     assert run_chain(remote, chain).failed == 1
     assert not target_path(chain).exists()
 
@@ -294,3 +294,63 @@ def test_long_unicode_filename_and_collision_are_handled(remote, chain):
     assert target.read_bytes() == b"existing contents"
     assert run_chain(remote, chain).unchanged == 1
     assert len(remote.downloads) == 1
+
+
+def test_downloads_only_pending_files_in_bounded_batches(remote, chain, monkeypatch):
+    monkeypatch.setattr(backup, "BATCH_SIZE", 2)
+    remote.add("existing.jpg")
+    target = target_path(chain, name="existing.jpg")
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"photo contents")
+    new = [remote.add(f"file-{i}.jpg").path for i in range(5)]
+    result = run_chain(remote, chain)
+    assert (result.copied, result.unchanged, result.failed) == (5, 1, 0)
+    assert remote.batches == [tuple(new[:2]), tuple(new[2:4]), tuple(new[4:])]
+    assert_no_staging(chain)
+
+
+def test_dry_run_scans_each_relevant_folder_once(remote, chain, monkeypatch):
+    for name in ("one.jpg", "two.jpg", "three.jpg"):
+        remote.add(name)
+    archive = target_path(chain).parent
+    archive.mkdir(parents=True)
+    (archive / "one.jpg").write_bytes(b"photo contents")
+    real_scandir = os.scandir
+    scan = Mock(side_effect=real_scandir)
+    real_stat = backup._existing_size
+    check_size = Mock(side_effect=real_stat)
+    monkeypatch.setattr(backup.os, "scandir", scan)
+    monkeypatch.setattr(backup, "_existing_size", check_size)
+    result = run_chain(remote, chain, dry_run=True)
+    assert (result.unchanged, result.planned) == (1, 2)
+    assert [call.args[0] for call in scan.call_args_list] == [chain.destination, archive]
+    check_size.assert_called_once_with(archive / "one.jpg")
+    assert not remote.batches
+
+
+def test_failed_batch_only_publishes_matching_checksums(remote, chain, monkeypatch):
+    monkeypatch.setattr(backup, "BATCH_SIZE", 3)
+    bad = remote.add("broken.jpg")
+    remote.payloads[bad.path] = KeeperError("transfer failed")
+    remote.add("no-checksum.jpg", checksum=None)
+    remote.add("verified.jpg")
+    remote.add("next-batch.jpg", checksum=None)
+    result = run_chain(remote, chain)
+    assert (result.copied, result.failed) == (2, 2)
+    assert not target_path(chain, name="broken.jpg").exists()
+    assert not target_path(chain, name="no-checksum.jpg").exists()
+    assert target_path(chain, name="verified.jpg").is_file()
+    assert target_path(chain, name="next-batch.jpg").is_file()
+    assert_no_staging(chain)
+
+
+def test_interrupt_keeps_published_batches(remote, chain, monkeypatch):
+    monkeypatch.setattr(backup, "BATCH_SIZE", 1)
+    remote.add("first.jpg")
+    second = remote.add("second.jpg")
+    remote.payloads[second.path] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        run_chain(remote, chain)
+    assert target_path(chain, name="first.jpg").is_file()
+    assert not target_path(chain, name="second.jpg").exists()
+    assert_no_staging(chain)

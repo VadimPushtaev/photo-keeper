@@ -3,6 +3,7 @@
 import json
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -58,7 +59,9 @@ class Rclone:
     def __init__(self, config_file: Path | None = None) -> None:
         self.config_file = config_file
 
-    def _run(self, *arguments: str, interactive: bool = False) -> str:
+    def _run(
+        self, *arguments: str, interactive: bool = False, input_text: str | None = None
+    ) -> str:
         command = ["rclone"]
         if self.config_file is not None:
             command.extend(("--config", str(self.config_file)))
@@ -68,6 +71,7 @@ class Rclone:
                 check=True,
                 text=True,
                 capture_output=not interactive,
+                input=input_text,
             )
         except FileNotFoundError as exc:
             raise KeeperError("rclone is required and must be available on PATH.") from exc
@@ -99,9 +103,21 @@ class Rclone:
             seen.add(entry.path)
         return files
 
-    def download(self, source: str, entry: RemoteFile, target: Path) -> None:
-        prefix = source if source.endswith((":", "/")) else source + "/"
-        self._run("copyto", "--max-depth", "1", "--", prefix + entry.path.as_posix(), str(target))
+    def download_batch(self, source: str, entries: Sequence[RemoteFile], target: Path) -> None:
+        manifest = "".join(f"{entry.path.as_posix()}\n" for entry in entries)
+        self._run(
+            "copy",
+            "--files-from-raw",
+            "-",
+            "--no-traverse",
+            "--no-unicode-normalization",
+            "--transfers",
+            "4",
+            "--",
+            source,
+            str(target),
+            input_text=manifest,
+        )
 
     def quickxor(self, path: Path) -> str:
         output = self._run("hashsum", "quickxor", "--", str(path))
