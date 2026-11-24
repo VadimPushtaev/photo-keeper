@@ -1,6 +1,13 @@
-# Copy to config.toml and add a table for each chain.
-# Only chain names and enabled flags are supported in the scaffold.
-# Execution and media operations will be implemented separately.
+# Copy to config.toml and edit the destination. Keep personal chains in config.toml.
+[dropbox]
+# Relative paths are resolved against this configuration file, not the working directory.
+credentials_file = ".secrets/dropbox.json"
+
 [[chains]]
 name = "example"
 enabled = false
+source = "/Camera Uploads"
+destination = "/absolute/path/to/photos"
+subdirectory = "phone/__raw__"
+recursive = true
+date_source = "capture"

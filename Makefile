@@ -14,7 +14,7 @@ format:
 	poetry run ruff format .
 
 test:
-	poetry run pytest
+	poetry run pytest --cov=photo_keeper --cov-branch --cov-report=term-missing --cov-fail-under=95
 
 build:
 	poetry build

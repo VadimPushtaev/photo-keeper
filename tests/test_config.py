@@ -8,7 +8,8 @@ from photo_keeper.config import ConfigError, load_config
 def test_load_multiple_chains(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[[chains]]\nname = "first"\nenabled = true\n[[chains]]\nname = "second"\n',
+        '[[chains]]\nname = "first"\nenabled = true\nsource = "/Camera Uploads"\n'
+        'destination = "/photos"\n[[chains]]\nname = "second"\n',
         encoding="utf-8",
     )
 
@@ -63,3 +64,107 @@ def test_invalid_encoding(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="Cannot load"):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ('source = "relative"', "absolute Dropbox"),
+        ('source = "/a/../b"', "relative path"),
+        ('source = "/a//b"', "relative path"),
+        ('source = "/a/"', "relative path"),
+        ('source = "/a/./b"', "relative path"),
+        ("source = 42", "nonempty"),
+        ('source = ""', "nonempty"),
+        ('destination = "relative"', "absolute local"),
+        ("destination = false", "nonempty"),
+        ('destination = ""', "nonempty"),
+        ('subdirectory = "/outside"', "relative path"),
+        ('subdirectory = "../outside"', "relative path"),
+        ('subdirectory = "a/../outside"', "relative path"),
+        ('subdirectory = "a//b"', "relative path"),
+        ('subdirectory = "C:/outside"', "relative path"),
+        ("subdirectory = 'a\\b'", "relative path"),
+        ('subdirectory = ""', "nonempty"),
+        ("subdirectory = []", "nonempty"),
+        ('recursive = "true"', "boolean"),
+        ("recursive = 1", "boolean"),
+        ('date_source = "upload"', "date_source"),
+        ("date_source = []", "date_source"),
+        ("date_source = 1", "date_source"),
+        ('name = "line\\nfeed"', "control characters"),
+    ],
+)
+def test_copy_settings_are_validated(tmp_path: Path, field: str, message: str) -> None:
+    path = tmp_path / "config.toml"
+    base = "[[chains]]\n" + ("" if field.startswith("name =") else 'name = "test"\n')
+    path.write_text(base + field, encoding="utf-8")
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+@pytest.mark.parametrize("settings", ["", 'source = "/"', 'destination = "/photos"'])
+def test_enabled_chain_requires_source_and_destination(tmp_path: Path, settings: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[chains]]\nname = "test"\nenabled = true\n' + settings)
+    with pytest.raises(ConfigError, match="require source and destination"):
+        load_config(path)
+
+
+def test_root_source_and_unicode_destination(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[chains]]\nname = "test"\nenabled = true\nsource = "/"\n'
+        'destination = "/photos/Фото"\nsubdirectory = "Камера/__raw__"\n'
+        'recursive = false\ndate_source = "modified"',
+        encoding="utf-8",
+    )
+    chain = load_config(path).chains[0]
+    assert chain.source == "/"
+    assert chain.destination == Path("/photos/Фото")
+    assert chain.subdirectory == "Камера/__raw__"
+    assert chain.recursive is False
+    assert chain.date_source == "modified"
+
+
+def test_credentials_path_is_relative_to_config_not_cwd(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "config-dir"
+    folder.mkdir()
+    path = folder / "settings.toml"
+    path.write_text('[dropbox]\ncredentials_file = "private/token.json"')
+    monkeypatch.chdir(tmp_path)
+    assert load_config(path).credentials_file == folder / "private/token.json"
+
+
+def test_default_credentials_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("")
+    assert load_config(path).credentials_file == tmp_path / ".secrets/dropbox.json"
+
+
+def test_absolute_credentials_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[dropbox]\ncredentials_file = "/private/token.json"')
+    assert load_config(path).credentials_file == Path("/private/token.json")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'dropbox = "wrong"',
+        "[dropbox]\ncredentials_file = 42",
+        '[dropbox]\ncredentials_file = ""',
+        '[dropbox]\nrefresh_token = "secret"',
+    ],
+)
+def test_invalid_dropbox_settings(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(content)
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_committed_example_is_valid_and_disabled() -> None:
+    config = load_config(Path(__file__).parents[1] / "config.example.toml")
+    assert config.chains
+    assert all(not chain.enabled for chain in config.chains)

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Configurable backup chains for photos and other media."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["dropbox (>=12,<13)", "requests (>=2.32,<3)"]
 
 [project.scripts]
 photo-keeper = "photo_keeper.cli:main"
@@ -15,6 +15,7 @@ packages = [{ include = "photo_keeper", from = "src" }]
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.4,<10"
 ruff = ">=0.15,<0.17"
+pytest-cov = ">=6,<8"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
