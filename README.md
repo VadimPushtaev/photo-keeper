@@ -131,7 +131,9 @@ it again. Each run holds a lock in the destination root to prevent overlapping c
 Failed downloads are cleaned up on exit.
 An abrupt kill or power loss can leave a hidden `.photo-keeper-*` staging directory.
 
-The summary reports counts for downloads, sorting, cleanup, and their previews. Exit codes are `0` for
+The summary reports counts for downloads, sorting, cleanup, and their previews.
+`sorted` counts new monthly copies. `sort_unchanged` counts existing monthly copies verified
+against their raw files. Exit codes are `0` for
 success, `1` for runtime or copy failures, `2` for configuration or usage errors, and `130`
 for an interrupted run. Results go to stdout and timestamped logs go to stderr.
 

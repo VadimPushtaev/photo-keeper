@@ -79,7 +79,8 @@ def execute(args: argparse.Namespace) -> int:
     print(
         f"{'Dry run' if args.dry_run else 'Run'} {chain.name}: "
         f"copied={result.copied}, unchanged={result.unchanged}, planned={result.planned}, "
-        f"sorted={result.sorted}, sort_planned={result.sort_planned}, "
+        f"sorted={result.sorted}, sort_unchanged={result.sort_unchanged}, "
+        f"sort_planned={result.sort_planned}, "
         f"source_deleted={result.source_deleted}, raw_deleted={result.raw_deleted}, "
         f"source_delete_planned={result.source_delete_planned}, "
         f"raw_delete_planned={result.raw_delete_planned}, "

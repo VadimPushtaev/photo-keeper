@@ -56,6 +56,7 @@ def test_real_local_rclone_remote_and_capture_year(tmp_path, capfd, caplog):
         '[[chains]]\nname = "camera"\nenabled = true\nsource = "fixture:Camera Uploads"\n'
         f"destination = {json.dumps(str(archive), ensure_ascii=False)}\n"
         'subdirectory = "Камера/__raw__"\n'
+        "sort_by_month = true\n"
     )
     args = ["--config", str(conf), "run", "camera"]
     assert main([*args, "--dry-run"]) == 0, caplog.text
@@ -66,13 +67,16 @@ def test_real_local_rclone_remote_and_capture_year(tmp_path, capfd, caplog):
     assert main(args) == 0, caplog.text
     copied = capfd.readouterr()
     assert "copied=2" in copied.out
+    assert "sorted=2, sort_unchanged=0" in copied.out
     assert "100%" in copied.err and "ETA" in copied.err
     local_photo = archive / "2021/Камера/__raw__/Поездка/Снимок.png"
     assert local_photo.read_bytes() == remote_photo.read_bytes()
     assert local_photo.stat().st_mtime == timestamp
     assert (archive / "2025/Камера/__raw__/# note [file].txt").read_bytes() == b"sidecar"
     assert main(args) == 0, caplog.text
-    assert "unchanged=2" in capfd.readouterr().out
+    repeat = capfd.readouterr().out
+    assert "unchanged=2" in repeat
+    assert "sorted=0, sort_unchanged=2" in repeat
 
 
 @pytest.mark.skipif(not shutil.which("rclone"), reason="Requires rclone")

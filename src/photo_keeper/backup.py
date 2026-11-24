@@ -29,6 +29,7 @@ class RunResult:
     planned: int = 0
     failed: int = 0
     sorted: int = 0
+    sort_unchanged: int = 0
     sort_planned: int = 0
     source_deleted: int = 0
     raw_deleted: int = 0
@@ -365,6 +366,7 @@ def run_chain(client: Rclone, chain: ChainConfig, *, dry_run: bool = False) -> R
                 dry_run=dry_run,
             )
             result.sorted = sorted_files.sorted
+            result.sort_unchanged = sorted_files.unchanged
             result.sort_planned = sorted_files.planned
             result.failed += sorted_files.failed
 

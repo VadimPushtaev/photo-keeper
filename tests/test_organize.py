@@ -57,7 +57,8 @@ def test_sort_classifies_and_preserves_original_bytes_and_mtime(
     assert dest.read_bytes() == raw.read_bytes()
     assert dest.stat().st_mtime_ns == raw.stat().st_mtime_ns
     assert dest.stat().st_ino != raw.stat().st_ino
-    assert run_chain(remote, monthly).sorted == 0
+    repeat = run_chain(remote, monthly)
+    assert (repeat.sorted, repeat.sort_unchanged) == (0, 1)
 
 
 @pytest.mark.parametrize("source", ["capture", "modified"])

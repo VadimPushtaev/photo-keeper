@@ -35,6 +35,7 @@ class SortedCopy:
 class SortResult:
     copies: list[SortedCopy]
     sorted: int = 0
+    unchanged: int = 0
     planned: int = 0
     failed: int = 0
 
@@ -107,6 +108,7 @@ def sort_raw(
             copy = SortedCopy(raw, raw.relative_to(raw_root), target, info.st_size, digest)
             if unchanged:
                 result.copies.append(copy)
+                result.unchanged += 1
             elif dry_run:
                 result.planned += 1
                 logger.info("Would sort %s to %s", raw, target)
